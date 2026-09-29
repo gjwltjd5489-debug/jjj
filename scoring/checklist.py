@@ -27,6 +27,7 @@ class Check:
     status: str
     detail: str
     tag: str = ""      # 성향 판정에 쓰는 짧은 표기 (변동성 '고변동', 과열 '정상' 등)
+    short: str = ""    # 상세 표에 쓰는 핵심 수치 (예: '+7.0%', 'RSI 52')
     na: bool = False   # 데이터 부족으로 계산 안 됨
 
 
@@ -208,6 +209,24 @@ def build_report(df: pd.DataFrame, p: Profile, ticker: str, name: str = "", grou
     else:
         checks.append(Check("과열", "이격도", NEUTRAL, f"{m}선 대비 {dv:+.1%}, 1년 백분위 {dp:.0%}", "정상"))
 
+    # 상세 표용 핵심 수치
+    def rank_text(pct: float) -> str:
+        return f"상위 {1 - pct:.0%}" if pct >= 0.5 else f"하위 {pct:.0%}"
+
+    shorts = {
+        "200일선": f"200일선 {c / r['ma_long'] - 1:+.1%}" if pd.notna(r["ma_long"]) else "",
+        "MACD": ("MACD▲" if r["macd"] > r["signal"] else "MACD▼") if pd.notna(r["macd"]) else "",
+        "RSI": f"RSI {rsi:.0f}" if pd.notna(rsi) else "",
+        "ADX": f"ADX {adx:.0f}" if pd.notna(adx) else "",
+        "VR": f"VR {vr:.0f}% ({rank_text(vr_pct)})" if pd.notna(vr_pct) else "",
+        "OBV": ("OBV▲" if obv_chg.iloc[-1] > 0 else "OBV▼") if pd.notna(obv_chg.iloc[-1]) else "",
+        "상대강도": f"3개월 {r['rs_ret']:+.1%}" if bench is not None and pd.notna(r["rs_ret"]) else "",
+        "변동성": f"연 {rv:.0%} ({rank_text(rv_pct)})" if pd.notna(rv_pct) else "",
+        "이격도": f"50일선 {dv:+.1%} ({rank_text(dp)})" if pd.notna(dp) else "",
+    }
+    for chk in checks:
+        chk.short = shorts.get(chk.name) or ("" if chk.na else chk.detail.replace("전환선 ", "전환").replace(" 기준선", "기준"))
+
     # 오늘 이벤트
     ev: list[str] = []
     if _crossed_up(x["ma_mid"], x["ma_long"]) or any(_crossed_up(x["ma_mid"], x["ma_long"], k) for k in range(-5, -1)):
@@ -368,7 +387,8 @@ def _badge_html(group: str, v: str) -> str:
 
 _BADGE_CSS = (".ck .b{display:inline-block;min-width:40px;padding:2px 5px;border-radius:4px;font-weight:bold}"
               + "".join(f".ck .b.b{k}{{background:{BG[k]};color:{FG[k]}}}" for k in BG)
-              + ".ck .chg{display:inline-block;outline:2px solid #fbc02d;border-radius:5px}.ck .dot{color:#f9a825}")
+              + ".ck .chg{display:inline-block;outline:2px solid #fbc02d;border-radius:5px}.ck .dot{color:#f9a825}"
+              + ".ck td.dt{font-size:12px;line-height:1.45;padding:4px 6px;vertical-align:top;border-bottom:2px solid #fff}")
 
 
 # ---------------------------------------------------------------- 출력
@@ -455,6 +475,28 @@ def make_subject(reports: list[TickerReport], meta: dict) -> str:
     return subject if len(subject) <= 100 else subject[:99] + "…"
 
 
+TINT = {"g": "#eef7ee", "o": "#fff5e6", "r": "#fdeeee", "n": "#f6f6f6"}
+
+
+def _detail_cell_items(r: TickerReport, g: str) -> list[tuple[str, bool]]:
+    """(핵심 수치, 전일 대비 바뀜) 목록."""
+    changed = {now.name for _, now in r.changes}
+    return [(c.short or "–", c.name in changed) for c in r.checks if c.group == g]
+
+
+def _detail_md_cell(r: TickerReport, g: str) -> str:
+    color, _ = badge(g, verdict(r.checks, g))
+    items = [f"**{t}**" if ch else t for t, ch in _detail_cell_items(r, g)]
+    return f"{DOT[color]} " + " · ".join(items)
+
+
+def _detail_html_cell(r: TickerReport, g: str) -> str:
+    color, _ = badge(g, verdict(r.checks, g))
+    items = [f"<b>{html.escape(t)}</b> <span class='dot'>●</span>" if ch else html.escape(t)
+             for t, ch in _detail_cell_items(r, g)]
+    return f"<td class='dt' style='background:{TINT[color]};border-left:3px solid {FG[color]}'>{'<br>'.join(items)}</td>"
+
+
 def _detail_line(r: TickerReport) -> str:
     parts = []
     for g, names, _ in GROUPS:
@@ -496,9 +538,12 @@ def render_markdown(reports: list[TickerReport], meta: dict | None = None) -> st
     out += ["", "## 오늘의 이벤트"]
     ev = [f"- **{r.ticker}**: {', '.join(r.events)}" for r in reports if r.events]
     out += ev or ["- 없음"]
-    out += ["", "## 상세"]
+    out += ["", "## 상세 (성향별 핵심 수치, 굵은 글씨 = 전일 대비 바뀐 항목)"]
+    header = ["종목"] + [SHORT[g] for g, _, _ in GROUPS]
+    out.append("| " + " | ".join(header) + " |")
+    out.append("|" + "---|" * len(header))
     for r in reports:
-        out.append(f"- **{r.ticker}** {r.name}: {_detail_line(r)}")
+        out.append("| " + " | ".join([f"**{r.ticker}**"] + [_detail_md_cell(r, g) for g, _, _ in GROUPS]) + " |")
     out += ["", LEGEND]
     return "\n".join(out)
 
@@ -607,8 +652,16 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
     parts.append("<h3>오늘의 이벤트</h3>" + (
         "<ul>" + "".join(f"<li><b>{e(r.ticker)}</b>: {e(', '.join(r.events))}</li>" for r in evs) + "</ul>"
         if evs else "<p>없음</p>"))
-    parts.append("<h3>상세</h3><table>")
+    parts.append("<h3>상세 <span class='m' style='font-weight:normal;font-size:12px'>"
+                 "성향별 핵심 수치 · 칸 색 = 성향 판정 · 굵은 글씨와 ● = 전일 대비 바뀐 항목</span></h3><table><tr><th>종목</th>")
+    for g, _, _ in GROUPS:
+        parts.append(f"<th>{e(SHORT[g])}</th>")
+    parts.append("</tr>")
+    group = None
     for r in reports:
-        parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b></td><td class='d'>{e(_detail_line(r))}</td></tr>")
+        if r.group and r.group != group:
+            group = r.group
+            parts.append(f"<tr><td colspan='{len(GROUPS) + 1}' class='g'>{e(group)}</td></tr>")
+        parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b></td>" + "".join(_detail_html_cell(r, g) for g, _, _ in GROUPS) + "</tr>")
     parts.append(f"</table><p class='m' style='font-size:12px;margin-top:16px'>{e(LEGEND)}</p></div>")
     return "".join(parts)

@@ -330,10 +330,51 @@ def verdict(checks: list[Check], group: str) -> str:
     return tags[0] if len(items) == 1 and tags else "↔"
 
 
+# ---------------------------------------------------------------- 신호등 표시 (초록 / 주황 / 빨강)
+
+DOT = {"g": "🟢", "o": "🟠", "r": "🔴", "n": "⚪"}
+BG = {"g": "#c8e6c9", "o": "#ffe0b2", "r": "#ffcdd2", "n": "#eeeeee"}
+FG = {"g": "#1b5e20", "o": "#e65100", "r": "#b71c1c", "n": "#757575"}
+_UP_LABEL = {"추세 강도": "상승추세", "상대강도": "강함"}
+_DN_LABEL = {"추세 강도": "하락추세", "상대강도": "약함"}
+
+
+def badge(group: str, v: str) -> tuple[str, str]:
+    """판정 → (색 키, 한글 라벨). 초록 = 강세·정상, 주황 = 혼조·주의, 빨강 = 약세."""
+    if v == "↑":
+        return "g", _UP_LABEL.get(group, "강세")
+    if v == "↓":
+        return "r", _DN_LABEL.get(group, "약세")
+    if v == "↔":
+        return "o", "혼조"
+    if v == "–":
+        return "n", "–"
+    if v.startswith("⚠️"):
+        return "o", v.replace("⚠️", "")
+    if v in ("횡보", "약함"):
+        return "o", v
+    return "g", v  # 보통·저변동·정상
+
+
+def badge_text(group: str, v: str) -> str:
+    color, label = badge(group, v)
+    return f"{DOT[color]}{label}"
+
+
+def _badge_html(group: str, v: str) -> str:
+    color, label = badge(group, v)
+    return f"<span class='b b{color}'>{html.escape(label)}</span>"
+
+
+_BADGE_CSS = (".ck .b{display:inline-block;min-width:40px;padding:2px 5px;border-radius:4px;font-weight:bold}"
+              + "".join(f".ck .b.b{k}{{background:{BG[k]};color:{FG[k]}}}" for k in BG)
+              + ".ck .chg{display:inline-block;outline:2px solid #fbc02d;border-radius:5px}.ck .dot{color:#f9a825}")
+
+
 # ---------------------------------------------------------------- 출력
 
-LEGEND = ("범례: 방향 성향 ↑ 강세 / ↓ 약세 / ↔ 혼조 / – 해당 없음 · 변동성·과열은 ⚠️ 주의 / 보통·정상. "
-          "항목은 ✅ 강세 / ❌ 약세 / ➖ 중립 / ⚠️ 주의. 노란 칸(마크다운은 [ ])은 직전 거래일과 판정이 달라진 성향. "
+LEGEND = ("범례: 🟢 강세·정상 / 🟠 혼조·주의(고변동·과열·과매도·횡보) / 🔴 약세 / ⚪ 해당 없음. "
+          "상세의 항목은 ✅ 강세 / ❌ 약세 / ➖ 중립 / ⚠️ 주의. 테두리 칸(마크다운은 [ ])은 직전 거래일과 판정이 달라진 성향. "
           "장기 = 200일선·이평 배열 · 중기 = 일목 구름·전환/기준 · 모멘텀 = MACD 시그널·RSI 50 · 추세 강도 = ADX≥25와 DMI 방향 · "
           "거래량 = VR 1년 백분위 50%·OBV 20일 증감 · 상대강도 = SPY 대비 비율의 50일 평균 · 변동성 = 20일 변동성 1년 백분위 80% 이상 ⚠️ · "
           "과열 = 50일선 이격도 1년 백분위 95% 이상(과열)·5% 이하(과매도) ⚠️. 현재 상태 요약이며 예측이나 매매 권유가 아님.")
@@ -347,14 +388,14 @@ def _headline(reports: list[TickerReport]) -> list[str]:
     def pick(cond):
         return [r.ticker for r in reports if cond(r)]
     rules = [
-        ("강세 정렬 (장기·중기·모멘텀 ↑)", lambda r: _v(r, "장기 추세") == _v(r, "중기 추세") == _v(r, "모멘텀") == "↑"),
-        ("약세 정렬 (장기·중기·모멘텀 ↓)", lambda r: _v(r, "장기 추세") == _v(r, "중기 추세") == _v(r, "모멘텀") == "↓"),
-        ("조정 중 (장기 ↑, 중기·모멘텀 ↓)", lambda r: _v(r, "장기 추세") == "↑" and _v(r, "중기 추세") == _v(r, "모멘텀") == "↓"),
-        ("반등 시도 (장기 ↓, 중기·모멘텀 ↑)", lambda r: _v(r, "장기 추세") == "↓" and _v(r, "중기 추세") == _v(r, "모멘텀") == "↑"),
-        ("반등 후보 (200일선 위 + RSI≤30)", lambda r: r.check("200일선").status == UP and "반등 후보" in r.check("RSI").detail),
-        ("과열 주의 (50일선 이격 1년 상위 5%)", lambda r: _v(r, "과열") == "⚠️과열"),
-        ("고변동 (변동성 1년 상위 20%)", lambda r: _v(r, "변동성") == "⚠️고변동"),
-        ("200일선 아래", lambda r: r.check("200일선").status == DOWN),
+        ("🟢 강세 정렬 (장기·중기·모멘텀 모두 강세)", lambda r: _v(r, "장기 추세") == _v(r, "중기 추세") == _v(r, "모멘텀") == "↑"),
+        ("🔴 약세 정렬 (장기·중기·모멘텀 모두 약세)", lambda r: _v(r, "장기 추세") == _v(r, "중기 추세") == _v(r, "모멘텀") == "↓"),
+        ("🟠 조정 중 (장기 강세, 중기·모멘텀 약세)", lambda r: _v(r, "장기 추세") == "↑" and _v(r, "중기 추세") == _v(r, "모멘텀") == "↓"),
+        ("🟠 반등 시도 (장기 약세, 중기·모멘텀 강세)", lambda r: _v(r, "장기 추세") == "↓" and _v(r, "중기 추세") == _v(r, "모멘텀") == "↑"),
+        ("🟠 반등 후보 (200일선 위 + RSI≤30)", lambda r: r.check("200일선").status == UP and "반등 후보" in r.check("RSI").detail),
+        ("🟠 과열 주의 (50일선 이격 1년 상위 5%)", lambda r: _v(r, "과열") == "⚠️과열"),
+        ("🟠 고변동 (변동성 1년 상위 20%)", lambda r: _v(r, "변동성") == "⚠️고변동"),
+        ("🔴 200일선 아래", lambda r: r.check("200일선").status == DOWN),
     ]
     lines = []
     for label, cond in rules:
@@ -387,7 +428,7 @@ def change_lines(reports: list[TickerReport]) -> tuple[str, list[str]]:
         parts = []
         for g, a, b in vc:
             items = [f"{now.name} {prev.status}→{now.status}" for prev, now in r.changes if now.group == g]
-            parts.append(f"{SHORT[g]} {a}→{b}" + (f" ({', '.join(items)})" if items else ""))
+            parts.append(f"{SHORT[g]} {badge_text(g, a)}→{badge_text(g, b)}" + (f" ({', '.join(items)})" if items else ""))
         lines.append(f"{r.ticker}: " + ", ".join(parts))
     return summary, lines
 
@@ -418,7 +459,7 @@ def _detail_line(r: TickerReport) -> str:
     parts = []
     for g, names, _ in GROUPS:
         items = " / ".join(f"{c.name} {c.status} {c.detail}" for c in r.checks if c.group == g)
-        parts.append(f"{SHORT[g]} {verdict(r.checks, g)} [{items}]")
+        parts.append(f"{SHORT[g]} {badge_text(g, verdict(r.checks, g))} [{items}]")
     return " · ".join(parts)
 
 
@@ -450,7 +491,7 @@ def render_markdown(reports: list[TickerReport], meta: dict | None = None) -> st
     for r in reports:
         changed = {g for g, _, _ in _verdict_changes(r)}
         row = [r.ticker + (" ⚠️" if r.issues else ""), f"{r.close:,.2f}", f"{r.change:+.1%}", f"{r.from_high:+.1%}"]
-        row += [f"[{_v(r, g)}]" if g in changed else _v(r, g) for g, _, _ in GROUPS]
+        row += [f"[{badge_text(g, _v(r, g))}]" if g in changed else badge_text(g, _v(r, g)) for g, _, _ in GROUPS]
         out.append("| " + " | ".join(row) + " |")
     out += ["", "## 오늘의 이벤트"]
     ev = [f"- **{r.ticker}**: {', '.join(r.events)}" for r in reports if r.events]
@@ -481,15 +522,15 @@ def render_text(reports: list[TickerReport], meta: dict | None = None) -> str:
         summary, cl = change_lines(reports)
         lines += [f"전일 대비 변화: {summary}"] + [f"- {x}" for x in cl] + [""]
         lines += ["성향별 판정 (장기 / 중기 / 모멘텀 / 추세강도 / 거래량 / 상대강도 / 변동성 / 과열)"]
-        lines += [f"- {r.ticker}: " + " / ".join(_v(r, g) for g, _, _ in GROUPS) for r in reports] + [""]
+        lines += [f"- {r.ticker}: " + " / ".join(badge_text(g, _v(r, g)) for g, _, _ in GROUPS) for r in reports] + [""]
     ev = [f"- {r.ticker}: {', '.join(r.events)}" for r in reports if r.events]
     lines += ["이벤트"] + (ev or ["- 없음"]) + ["", "표와 상세는 HTML 메일에서 볼 수 있습니다. 현재 상태 요약이며 매매 권유가 아닙니다."]
     return "\n".join(lines)
 
 
 _CSS = ("<style>.ck{font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222}"
-        ".ck table{border-collapse:collapse}.ck th{padding:6px 8px;background:#f2f2f2;border-bottom:2px solid #999;"
-        "white-space:nowrap}.ck td{padding:4px 8px;border-bottom:1px solid #ddd;white-space:nowrap}"
+        ".ck table{border-collapse:collapse}.ck th{padding:5px 5px;background:#f2f2f2;border-bottom:2px solid #999;"
+        "white-space:nowrap}.ck td{padding:3px 5px;border-bottom:1px solid #ddd;white-space:nowrap}"
         ".ck td.c{text-align:center}.ck td.l{text-align:left}.ck td.d{white-space:normal;font-size:13px}"
         ".ck .g{font-weight:bold;color:#555;padding-top:8px}.ck .m{color:#777}"
         ".ck .x{background:#ffe58a;border-radius:3px;padding:0 3px}"
@@ -498,11 +539,6 @@ _CSS = ("<style>.ck{font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;
         ".ck .box{border-left:4px solid #999;background:#fafafa;padding:6px 10px;margin:8px 0}"
         ".ck .warn{border-left-color:#e65100;background:#fff3e0}.ck .ok{border-left-color:#2e7d32;background:#f1f8e9}"
         ".ck h3{margin:14px 0 4px}.ck ul{margin:0;padding-left:20px}</style>")
-
-
-def _verdict_html(v: str) -> str:
-    cls = "up" if v == "↑" else "dn" if v == "↓" else "wr" if v.startswith("⚠️") else "nt"
-    return f"<span class='{cls}'>{html.escape(v)}</span>"
 
 
 def _ul(items: list[str], e) -> str:
@@ -517,7 +553,7 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
     heads = _headline(reports)
     qbox = (f"<div class='box warn'><b>데이터 점검 ⚠️</b>{_ul(q, e)}</div>" if q
             else f"<div class='box ok'><b>데이터 점검</b>: 이상 없음 ({len(reports)}종목, 기준일 {date})</div>")
-    parts = [_CSS, '<div class="ck">']
+    parts = [_CSS.replace("</style>", _BADGE_CSS + "</style>"), '<div class="ck">']
 
     if meta.get("mode") == "holiday":
         parts.append(f"<h2 style='margin:0 0 8px'>🇺🇸 미국장 휴장 · {e(str(meta['checked']))} {e(meta['holiday'])}</h2>")
@@ -543,7 +579,7 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
     parts.append(_ul(cl, e) if cl else "<p>없음</p>")
 
     parts.append("<h3>성향별 판정 <span class='m' style='font-weight:normal;font-size:12px'>"
-                 "노란 칸 = 전일과 판정이 달라진 성향 (마우스를 올리면 전일 판정)</span></h3><table><tr>")
+                 "🟢 강세·정렬 / 🟠 혼조·주의 / 🔴 약세 · 노란 테두리와 ● = 전일과 달라진 성향 (마우스를 올리면 전일 판정)</span></h3><table><tr>")
     for h in ["종목", "종가", "등락", "고점대비"] + [SHORT[g] for g, _, _ in GROUPS]:
         parts.append(f"<th>{e(h)}</th>")
     parts.append("</tr>")
@@ -560,9 +596,9 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
         parts.append(f"<td class='c'>{r.from_high:+.1%}</td>")
         prev = {g: a for g, a, _ in _verdict_changes(r)}
         for g, _, _ in GROUPS:
-            cell = _verdict_html(_v(r, g))
+            cell = _badge_html(g, _v(r, g))
             if g in prev:
-                cell = f"<span class='x' title='전일 {e(prev[g])}'>{cell}</span>"
+                cell = f"<span class='chg' title='전일 {e(badge(g, prev[g])[1])}'>{cell}</span> <span class='dot'>●</span>"
             parts.append(f"<td class='c'>{cell}</td>")
         parts.append("</tr>")
     parts.append("</table>")

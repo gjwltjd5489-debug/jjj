@@ -142,18 +142,27 @@ def test_vr_capped_when_no_down_days():
 def test_trade_signal_groups_buy_and_sell():
     from scoring.checklist import TickerReport, signal_groups
     base = dict(name="", group="", date=pd.Timestamp("2026-09-29"), close=100.0, change=0.0, from_high=0.0, checks=[])
-    buy = TickerReport(ticker="B", sig={"v2": 72, "v3": 68, "held": True, "event": "BUY", "pullback": True,
-                                        "stop": 95.0, "close": 100.0}, **base)
-    sell = TickerReport(ticker="S", sig={"v2": 38, "v3": 40, "held": False, "event": "SELL", "pullback": False,
-                                         "stop": 90.0, "close": 100.0}, **base)
-    near = TickerReport(ticker="N", sig={"v2": 45, "v3": 40, "held": True, "event": "", "pullback": False,
-                                         "stop": 90.0, "close": 100.0}, **base)
-    g = signal_groups([buy, sell, near])
-    assert [r.ticker for r, _ in g["buy"]] == ["B"] and "눌림목 진입" in g["buy"][0][1] and "-5.0%" in g["buy"][0][1]
-    assert [r.ticker for r, _ in g["sell"]] == ["S"] and [r.ticker for r, _ in g["near_exit"]] == ["N"]
+
+    def sig(**kw):
+        d = {"score": 50.0, "score_s": 50.0, "held": False, "event": "", "blocked": "", "stop": 95.0, "close": 100.0}
+        d.update(kw)
+        return d
+    reps = [
+        TickerReport(ticker="B", sig=sig(score=83, score_s=75, held=True, event="BUY"), **base),
+        TickerReport(ticker="S", sig=sig(score=33, score_s=38, event="SELL"), **base),
+        TickerReport(ticker="K", sig=sig(score=83, score_s=80, blocked="과열"), **base),
+        TickerReport(ticker="N", sig=sig(score=50, score_s=45, held=True), **base),
+        TickerReport(ticker="H", sig=sig(score=83, score_s=83, held=True), **base),
+    ]
+    g = signal_groups(reps)
+    assert [r.ticker for r, _ in g["buy"]] == ["B"] and "-5.0%" in g["buy"][0][1]
+    assert [r.ticker for r, _ in g["sell"]] == ["S"]
+    assert [r.ticker for r, _ in g["blocked"]] == ["K"] and "과열" in g["blocked"][0][1]
+    assert [r.ticker for r, _ in g["near_exit"]] == ["N"] and [r.ticker for r, _ in g["hold"]] == ["H"]
 
 
 def test_trade_signal_on_real_like_series():
     r = build_with_history(smooth(0.002, n=700), P, "UP")
-    assert r.sig is not None and r.sig["held"] and r.sig["stop"] < r.sig["close"]
+    assert r.sig is not None and r.sig["stop"] < r.sig["close"]
+    assert abs(r.sig["score"] - r.score) < 1e-9  # 신호 점수 = 메일 표 색으로 센 점수
     assert "매수·매도 신호" in render_html([r], {"mode": "normal", "failed": []})

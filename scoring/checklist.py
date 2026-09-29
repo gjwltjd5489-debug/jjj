@@ -14,8 +14,9 @@ import numpy as np
 import pandas as pd
 
 from .profiles import Profile
-from .indicators import atr, rolling_pct_rank
-from .score import compute_all, compute_indicators
+from .checklist_score import RULE, checklist_score, points_from_verdicts
+from .indicators import rolling_pct_rank
+from .score import compute_indicators
 
 UP, DOWN, WARN, NEUTRAL = "✅", "❌", "⚠️", "➖"
 
@@ -44,7 +45,7 @@ class TickerReport:
     events: list[str] = field(default_factory=list)
     prev_checks: list[Check] | None = None   # 직전 거래일 체크리스트
     issues: list[str] = field(default_factory=list)  # 데이터 점검 경고
-    sig: dict | None = None  # 매수·매도 신호 (v6 규칙: 진입 v3 65↑ 또는 v2 70↑, 퇴출 v2 ≤ 40)
+    sig: dict | None = None  # 체크리스트 점수 기반 매수·매도 신호 (scoring/checklist_score.py)
 
     @property
     def changes(self) -> list[tuple[Check, Check]]:
@@ -59,6 +60,15 @@ class TickerReport:
         if self.prev_checks is None:
             return None
         return sum(verdict(self.prev_checks, g) == "↑" for g, _, kind in GROUPS if kind == "dir")
+
+    @property
+    def score(self) -> float:
+        """체크리스트 점수 (0~100): 방향 성향 (🟢 수 − 🔴 수) ÷ 판정 가능 수 → 50 ± 50."""
+        return checklist_points(self.checks)
+
+    @property
+    def prev_score(self) -> float | None:
+        return None if self.prev_checks is None else checklist_points(self.prev_checks)
 
     def verdicts(self) -> dict[str, str]:
         return {g: verdict(self.checks, g) for g, _, _ in GROUPS}
@@ -316,66 +326,81 @@ def build_with_history(df: pd.DataFrame, p: Profile, ticker: str, name: str = ""
     return rep
 
 
-# ---------------------------------------------------------------- 매수·매도 신호 (규칙 기반)
+# ---------------------------------------------------------------- 체크리스트 점수 + 매수·매도 신호
 
-ENTRY_PULLBACK = 65   # v3 눌림 점수 상향 돌파
-ENTRY_TREND = 70      # v2 추세 점수 상향 돌파
-EXIT_LEVEL = 40       # v2 추세 점수 이하 → 퇴출
-NEAR_EXIT = 50        # 보유 중 v2 가 이 아래면 '청산 임박'
-STOP_ATR = 2.0        # 손절 참고가 = 종가 − 2×ATR(14)
+_POINT = {"↑": 1, "↓": -1, "–": None}
+
+
+def checklist_points(checks: list[Check]) -> float:
+    """메일 표의 방향 성향 색으로 계산하는 점수 (🟢 +1, 🟠 0, 🔴 −1, ⚪ 제외)."""
+    dirs = [g for g, _, kind in GROUPS if kind == "dir"]
+    return points_from_verdicts({g: _POINT.get(verdict(checks, g), 0) for g in dirs})
+
+
+def color_counts(checks: list[Check]) -> tuple[int, int, int]:
+    """방향 성향의 (🟢, 🟠, 🔴) 개수."""
+    vals = [_POINT.get(verdict(checks, g), 0) for g, _, kind in GROUPS if kind == "dir" and verdict(checks, g) != "–"]
+    return sum(v == 1 for v in vals), sum(v == 0 for v in vals), sum(v == -1 for v in vals)
 
 
 def trade_signal(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None) -> dict | None:
-    """v6 조합 규칙(docs/rotation.md)의 오늘 상태. 지표가 준비되지 않았으면 None."""
+    """체크리스트 점수 규칙의 오늘 상태. 지표가 준비되지 않았으면 None."""
     try:
-        res = compute_all(df, p, ["v5", "v6"], bench)
+        o = checklist_score(df, p, bench)
     except Exception:
         return None
-    v5, v6 = res["v5"].iloc[-1], res["v6"].iloc[-1]
-    if pd.isna(v6["state"]) or pd.isna(v6["v2"]):
+    last = o.iloc[-1]
+    if pd.isna(last["score_s"]) or pd.isna(last["state"]):
         return None
-    a = atr(df, 14).iloc[-1]
-    c = float(df["Close"].iloc[-1])
-    return {"v2": float(v6["v2"]), "v3": float(v6["v3"]) if pd.notna(v6["v3"]) else np.nan,
-            "held": v6["state"] == 1, "event": v6["event"], "pullback": v5["event"] == "BUY",
-            "stop": c - STOP_ATR * a if pd.notna(a) else np.nan, "close": c}
+    return {"score": float(last["score"]), "score_s": float(last["score_s"]), "held": last["state"] == 1,
+            "event": last["event"], "blocked": last["blocked"], "stop": float(last["stop"]),
+            "close": float(last["close"])}
 
 
 def signal_groups(reports: list[TickerReport]) -> dict[str, list[tuple[TickerReport, str]]]:
-    """buy / sell / near_exit / hold 로 나눈 (종목, 설명)."""
-    out = {"buy": [], "sell": [], "near_exit": [], "hold": []}
+    """buy / sell / blocked(진입 보류) / near_exit(청산 임박) / hold(규칙상 보유 구간)."""
+    out = {"buy": [], "sell": [], "blocked": [], "near_exit": [], "hold": []}
     for r in reports:
         g = r.sig
         if not g:
             continue
-        stop = f" · 손절 참고 {g['stop']:,.2f} ({g['stop'] / g['close'] - 1:+.1%})" if pd.notna(g["stop"]) else ""
+        up, mid, dn = color_counts(r.checks)
+        cnt = f"🟢{up} 🟠{mid} 🔴{dn}"
+        s_txt = f"점수 {g['score']:.0f} (3일 평균 {g['score_s']:.0f})"
+        stop = (f" · 손절 참고 {g['stop']:,.2f} ({g['stop'] / g['close'] - 1:+.1%})"
+                if pd.notna(g["stop"]) else "")
         if g["event"] == "BUY":
-            kind = "눌림목 진입" if g["pullback"] else "추세 확인 진입"
-            out["buy"].append((r, f"{kind} (v3 눌림 {g['v3']:.0f} · v2 추세 {g['v2']:.0f}){stop}"))
+            out["buy"].append((r, f"{s_txt} ≥ {RULE.entry:g} · {cnt}{stop}"))
         elif g["event"] == "SELL":
-            out["sell"].append((r, f"추세 이탈 (v2 추세 {g['v2']:.0f} ≤ {EXIT_LEVEL})"))
-        elif g["held"] and g["pullback"]:
-            out["buy"].append((r, f"보유 중 눌림 — 추가 매수 구간 (v3 눌림 {g['v3']:.0f} · v2 추세 {g['v2']:.0f}){stop}"))
-        elif g["held"] and g["v2"] <= NEAR_EXIT:
-            out["near_exit"].append((r, f"v2 추세 {g['v2']:.0f} (퇴출선 {EXIT_LEVEL}까지 {g['v2'] - EXIT_LEVEL:.0f})"))
+            out["sell"].append((r, f"3일 평균 점수 {g['score_s']:.0f} ≤ {RULE.exit:g} · {cnt}"))
+        elif not g["held"] and g["blocked"]:
+            out["blocked"].append((r, f"{s_txt} ≥ {RULE.entry:g}이지만 {g['blocked']}"))
+        elif g["held"] and g["score_s"] <= RULE.near_exit:
+            out["near_exit"].append((r, f"3일 평균 점수 {g['score_s']:.0f} (퇴출선 {RULE.exit:g}까지 "
+                                        f"{g['score_s'] - RULE.exit:.0f})"))
         elif g["held"]:
-            out["hold"].append((r, f"v2 {g['v2']:.0f}"))
+            out["hold"].append((r, f"{g['score_s']:.0f}"))
+    for k in ("buy", "hold"):
+        out[k].sort(key=lambda t: -t[0].sig["score_s"])
     return out
 
 
-SIGNAL_RULE = (f"진입: v3 눌림 점수 {ENTRY_PULLBACK} 상향 돌파(상승 국면의 눌림) 또는 v2 추세 점수 {ENTRY_TREND} 상향 돌파 · "
-               f"퇴출: v2 추세 점수 {EXIT_LEVEL} 이하 · 손절 참고가 = 종가 − {STOP_ATR:g}×ATR(14). "
-               "과거 검증(docs/rotation.md)에서 큰 하락 회피 효과는 있었으나 수익 예측력은 낮았음. 규칙 기반 참고 신호이며 매매 권유가 아님.")
+SIGNAL_RULE = (f"점수 = 방향 성향 6개(장기·중기·모멘텀·추세강도·거래량·상대강도)의 (🟢 수 − 🔴 수) ÷ 판정 가능한 성향 수를 "
+               f"0~100으로 환산 (50 = 중립, 🟠 0, ⚪ 제외). 진입: 3일 평균 점수 {RULE.entry:g} 이상 + 종가 200일선 위 + "
+               f"과열·고변동 아님 · 퇴출: 3일 평균 점수 {RULE.exit:g} 이하 · 손절 참고가 = 종가 − {RULE.stop_atr:g}×ATR(14). "
+               "검증(27종목, 2006~2026, docs/checklist_score.md): 보유 대비 최대낙폭 중앙값 −59%→−29%, 연수익률 8.2%→4.9%, "
+               "위험 대비 수익은 비슷. 점수 높은 종목이 다음 20일에 더 오르지는 않았음 — 하락 위험을 줄이는 용도. 매매 권유가 아님.")
 
 
 def _signal_md(reports: list[TickerReport]) -> list[str]:
     g = signal_groups(reports)
-    out = ["## 오늘의 매수·매도 신호"]
+    out = ["## 오늘의 매수·매도 신호 (체크리스트 점수)"]
     out += [f"- 🟢 **매수 {r.ticker}** — {t}" for r, t in g["buy"]] or ["- 🟢 매수: 오늘 신규 신호 없음"]
     out += [f"- 🔴 **매도 {r.ticker}** — {t}" for r, t in g["sell"]] or ["- 🔴 매도: 오늘 신규 신호 없음"]
+    out += [f"- ⚠️ 진입 보류 {r.ticker} — {t}" for r, t in g["blocked"]]
     out += [f"- 🟠 청산 임박 {r.ticker} — {t}" for r, t in g["near_exit"]]
     if g["hold"]:
-        out.append("- 규칙상 보유 구간: " + ", ".join(f"{r.ticker}({t})" for r, t in g["hold"]))
+        out.append("- 규칙상 보유 구간 (3일 평균 점수): " + ", ".join(f"{r.ticker} {t}" for r, t in g["hold"]))
     out += [f"- 기준: {SIGNAL_RULE}", ""]
     return out
 
@@ -387,21 +412,19 @@ def _signal_text(reports: list[TickerReport]) -> list[str]:
 def _signal_html(reports: list[TickerReport]) -> str:
     e = html.escape
     g = signal_groups(reports)
-    rows = []
-    for r, t in g["buy"]:
-        rows.append(f"<li><span class='b bbg'>🟢 매수</span> <b>{e(r.ticker)}</b> <span class='m'>{e(r.name)}</span> — {e(t)}</li>")
-    for r, t in g["sell"]:
-        rows.append(f"<li><span class='b bbr'>🔴 매도</span> <b>{e(r.ticker)}</b> <span class='m'>{e(r.name)}</span> — {e(t)}</li>")
-    for r, t in g["near_exit"]:
-        rows.append(f"<li><span class='b bbo'>🟠 청산 임박</span> <b>{e(r.ticker)}</b> — {e(t)}</li>")
-    if not g["buy"]:
-        rows.insert(0, "<li><span class='b bbg'>🟢 매수</span> 오늘 신규 신호 없음</li>")
-    if not g["sell"]:
-        rows.insert(len(g["buy"]) or 1, "<li><span class='b bbr'>🔴 매도</span> 오늘 신규 신호 없음</li>")
-    hold = ", ".join(f"{r.ticker}({t})" for r, t in g["hold"])
-    if hold:
-        rows.append(f"<li><span class='m'>규칙상 보유 구간: {e(hold)}</span></li>")
-    return ("<div class='box sig'><b>오늘의 매수·매도 신호</b><ul>" + "".join(rows) + "</ul>"
+
+    def li(cls: str, label: str, r: TickerReport, t: str) -> str:
+        return (f"<li><span class='b {cls}'>{label}</span> <b>{e(r.ticker)}</b> "
+                f"<span class='m'>{e(r.name)}</span> — {e(t)}</li>")
+    rows = [li("bbg", "🟢 매수", r, t) for r, t in g["buy"]] or ["<li><span class='b bbg'>🟢 매수</span> 오늘 신규 신호 없음</li>"]
+    rows += [li("bbr", "🔴 매도", r, t) for r, t in g["sell"]] or ["<li><span class='b bbr'>🔴 매도</span> 오늘 신규 신호 없음</li>"]
+    rows += [li("bbn", "⚠️ 진입 보류", r, t) for r, t in g["blocked"]]
+    rows += [li("bbo", "🟠 청산 임박", r, t) for r, t in g["near_exit"]]
+    if g["hold"]:
+        hold = ", ".join(f"{r.ticker} {t}" for r, t in g["hold"])
+        rows.append(f"<li><span class='m'>규칙상 보유 구간 (3일 평균 점수): {e(hold)}</span></li>")
+    return ("<div class='box sig'><b>오늘의 매수·매도 신호</b> <span class='m' style='font-size:12px'>(체크리스트 점수)</span>"
+            "<ul>" + "".join(rows) + "</ul>"
             f"<p class='m' style='font-size:12px;margin:4px 0 0'>{e(SIGNAL_RULE)}</p></div>")
 
 
@@ -464,6 +487,23 @@ def badge(group: str, v: str) -> tuple[str, str]:
     if v in ("횡보", "약함"):
         return "o", v
     return "g", v  # 보통·저변동·정상
+
+
+def score_color(score: float) -> str:
+    if pd.isna(score):
+        return "n"
+    return "g" if score >= RULE.entry else "r" if score <= RULE.exit else "o"
+
+
+def _score_html(r: TickerReport) -> str:
+    sc, prev = r.score, r.prev_score
+    if pd.isna(sc):
+        return "<span class='b bbn'>–</span>"
+    delta = ""
+    if prev is not None and pd.notna(prev) and round(prev) != round(sc):
+        d = sc - prev
+        delta = f" <span class='{'up' if d > 0 else 'dn'}' style='font-size:11px'>{'▲' if d > 0 else '▼'}{abs(d):.0f}</span>"
+    return f"<span class='b b{score_color(sc)}'>{sc:.0f}</span>{delta}"
 
 
 def badge_text(group: str, v: str) -> str:
@@ -541,7 +581,10 @@ def change_lines(reports: list[TickerReport]) -> tuple[str, list[str]]:
         for g, a, b in vc:
             items = [f"{now.name} {prev.status}→{now.status}" for prev, now in r.changes if now.group == g]
             parts.append(f"{SHORT[g]} {badge_text(g, a)}→{badge_text(g, b)}" + (f" ({', '.join(items)})" if items else ""))
-        lines.append(f"{r.ticker}: " + ", ".join(parts))
+        sc = ""
+        if r.prev_score is not None and pd.notna(r.prev_score) and round(r.prev_score) != round(r.score):
+            sc = f" (점수 {r.prev_score:.0f}→{r.score:.0f})"
+        lines.append(f"{r.ticker}{sc}: " + ", ".join(parts))
     return summary, lines
 
 
@@ -622,12 +665,13 @@ def render_markdown(reports: list[TickerReport], meta: dict | None = None) -> st
     summary, lines = change_lines(reports)
     out += [f"## 전일 대비 변화 — {summary}"] + ([f"- {x}" for x in lines] or ["- 없음"]) + [""]
     out.append("## 성향별 판정")
-    header = ["종목", "종가", "등락", "고점대비"] + [SHORT[g] for g, _, _ in GROUPS]
+    header = ["종목", "점수", "종가", "등락", "고점대비"] + [SHORT[g] for g, _, _ in GROUPS]
     out.append("| " + " | ".join(header) + " |")
     out.append("|" + "---|" * len(header))
     for r in reports:
         changed = {g for g, _, _ in _verdict_changes(r)}
-        row = [r.ticker + (" ⚠️" if r.issues else ""), f"{r.close:,.2f}", f"{r.change:+.1%}", f"{r.from_high:+.1%}"]
+        sc = "–" if pd.isna(r.score) else f"{DOT[score_color(r.score)]}{r.score:.0f}"
+        row = [r.ticker + (" ⚠️" if r.issues else ""), sc, f"{r.close:,.2f}", f"{r.change:+.1%}", f"{r.from_high:+.1%}"]
         row += [f"[{badge_text(g, _v(r, g))}]" if g in changed else badge_text(g, _v(r, g)) for g, _, _ in GROUPS]
         out.append("| " + " | ".join(row) + " |")
     out += ["", "## 오늘의 이벤트"]
@@ -663,16 +707,17 @@ def render_text(reports: list[TickerReport], meta: dict | None = None) -> str:
     if meta.get("mode") != "holiday":
         summary, cl = change_lines(reports)
         lines += [f"전일 대비 변화: {summary}"] + [f"- {x}" for x in cl] + [""]
-        lines += ["성향별 판정 (장기 / 중기 / 모멘텀 / 추세강도 / 거래량 / 상대강도 / 변동성 / 과열)"]
-        lines += [f"- {r.ticker}: " + " / ".join(badge_text(g, _v(r, g)) for g, _, _ in GROUPS) for r in reports] + [""]
+        lines += ["성향별 판정 (점수: 장기 / 중기 / 모멘텀 / 추세강도 / 거래량 / 상대강도 / 변동성 / 과열)"]
+        lines += [f"- {r.ticker} {r.score:.0f}점: " + " / ".join(badge_text(g, _v(r, g)) for g, _, _ in GROUPS)
+                  for r in reports] + [""]
     ev = [f"- {r.ticker}: {', '.join(r.events)}" for r in reports if r.events]
     lines += ["이벤트"] + (ev or ["- 없음"]) + ["", "표와 상세는 HTML 메일에서 볼 수 있습니다. 현재 상태 요약이며 매매 권유가 아닙니다."]
     return "\n".join(lines)
 
 
 _CSS = ("<style>.ck{font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222}"
-        ".ck table{border-collapse:collapse}.ck th{padding:5px 5px;background:#f2f2f2;border-bottom:2px solid #999;"
-        "white-space:nowrap}.ck td{padding:3px 5px;border-bottom:1px solid #ddd;white-space:nowrap}"
+        ".ck table{border-collapse:collapse}.ck th{padding:5px 4px;background:#f2f2f2;border-bottom:2px solid #999;"
+        "white-space:nowrap}.ck td{padding:3px 4px;border-bottom:1px solid #ddd;white-space:nowrap}"
         ".ck td.c{text-align:center}.ck td.l{text-align:left}.ck td.d{white-space:normal;font-size:13px}"
         ".ck .g{font-weight:bold;color:#555;padding-top:8px}.ck .m{color:#777}"
         ".ck .x{background:#ffe58a;border-radius:3px;padding:0 3px}"
@@ -722,19 +767,21 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
     parts.append(_ul(cl, e) if cl else "<p>없음</p>")
 
     parts.append("<h3>성향별 판정 <span class='m' style='font-weight:normal;font-size:12px'>"
-                 "🟢 강세·정렬 / 🟠 혼조·주의 / 🔴 약세 · 노란 테두리와 ● = 전일과 달라진 성향 (마우스를 올리면 전일 판정)</span></h3><table><tr>")
-    for h in ["종목", "종가", "등락", "고점대비"] + [SHORT[g] for g, _, _ in GROUPS]:
+                 f"점수 = 방향 성향 (🟢 − 🔴) 환산, {RULE.entry:g} 이상 🟢 · {RULE.exit:g} 이하 🔴 · "
+                 "노란 테두리와 ● = 전일과 달라진 성향 (마우스를 올리면 전일 판정)</span></h3><table><tr>")
+    for h in ["종목", "점수", "종가", "등락", "고점대비"] + [SHORT[g] for g, _, _ in GROUPS]:
         parts.append(f"<th>{e(h)}</th>")
     parts.append("</tr>")
     group = None
-    ncol = 4 + len(GROUPS)
+    ncol = 5 + len(GROUPS)
     for r in reports:
         if r.group and r.group != group:
             group = r.group
             parts.append(f"<tr><td colspan='{ncol}' class='g'>{e(group)}</td></tr>")
         color = "#c62828" if r.change > 0 else "#1565c0" if r.change < 0 else "#222"
         flag = " ⚠️" if r.issues else ""
-        parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b>{flag} <span class='m'>{e(r.name)}</span></td>")
+        parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b>{flag}<br><span class='m' style='font-size:11px'>{e(r.name)}</span></td>")
+        parts.append(f"<td class='c'>{_score_html(r)}</td>")
         parts.append(f"<td class='c'>{r.close:,.2f}</td><td class='c'><span style='color:{color}'>{r.change:+.1%}</span></td>")
         parts.append(f"<td class='c'>{r.from_high:+.1%}</td>")
         prev = {g: a for g, a, _ in _verdict_changes(r)}

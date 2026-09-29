@@ -12,6 +12,7 @@ QQQ 기준으로 시작했고, 종목별 프로파일로 확장할 수 있다. *
 | [docs/rotation.md](docs/rotation.md) | v5 조합 카드(v3 진입 + v2 청산), 저상관 바스켓 선정, 상위 n 로테이션 전략과 검증 |
 | [docs/data_sources.md](docs/data_sources.md) | 주가 데이터를 바로 받을 수 있는 사이트 검토 |
 | [docs/checklist_review.md](docs/checklist_review.md) | 일일 체크리스트 적정성 검토와 v2 (성향별 판정) |
+| [docs/checklist_score.md](docs/checklist_score.md) | 체크리스트 점수(성향 색으로 계산)와 매수·매도 규칙, 27종목 검증 |
 
 ## 설치
 ```bash

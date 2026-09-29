@@ -254,7 +254,7 @@ def render_html(reports: list[TickerReport]) -> str:
     td = 'style="padding:4px 8px;border-bottom:1px solid #ddd;text-align:center;white-space:nowrap"'
     tdl = 'style="padding:4px 8px;border-bottom:1px solid #ddd;text-align:left;white-space:nowrap"'
     th = 'style="padding:6px 8px;background:#f2f2f2;border-bottom:2px solid #999;white-space:nowrap"'
-    parts = [f'<div style="font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222">',
+    parts = ['<div style="font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222">',
              f"<h2 style='margin:0 0 8px'>미국장 지표 체크리스트 <span style='font-weight:normal;color:#666'>({date} 종가)</span></h2>"]
     heads = _headline(reports)
     if heads:

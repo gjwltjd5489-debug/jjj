@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 from scoring import get_profile
 from scoring.checklist import DOWN, NEUTRAL, UP, build_report, render_html, render_markdown
@@ -7,9 +8,18 @@ from tests.test_scoring import synthetic
 P = get_profile("QQQ")
 
 
+def smooth(drift, n=600, seed=0):
+    """잡음이 작아 마지막 날도 추세 방향이 분명한 시계열."""
+    rng = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(drift + rng.normal(0, 0.002, n)))
+    vol = np.where(np.diff(close, prepend=close[0]) * np.sign(drift) > 0, 2e6, 1e6)
+    return pd.DataFrame({"Open": close, "High": close * 1.002, "Low": close * 0.998, "Close": close, "Volume": vol},
+                        index=pd.bdate_range("2020-01-01", periods=n))
+
+
 def test_uptrend_mostly_bullish_and_renders():
-    up = build_report(synthetic(n=600, drift=0.003, seed=1), P, "UP", "상승", "테스트")
-    down = build_report(synthetic(n=600, drift=-0.003, seed=1), P, "DN", "하락", "테스트")
+    up = build_report(smooth(0.002), P, "UP", "상승", "테스트")
+    down = build_report(smooth(-0.002), P, "DN", "하락", "테스트")
     assert up.ups >= 8 and down.downs >= 8
     assert up.check("200일선").status == UP and down.check("200일선").status == DOWN
     md = render_markdown([up, down])

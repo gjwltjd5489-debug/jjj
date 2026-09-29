@@ -354,8 +354,8 @@ def verdict(checks: list[Check], group: str) -> str:
 DOT = {"g": "🟢", "o": "🟠", "r": "🔴", "n": "⚪"}
 BG = {"g": "#c8e6c9", "o": "#ffe0b2", "r": "#ffcdd2", "n": "#eeeeee"}
 FG = {"g": "#1b5e20", "o": "#e65100", "r": "#b71c1c", "n": "#757575"}
-_UP_LABEL = {"추세 강도": "상승추세", "상대강도": "강함"}
-_DN_LABEL = {"추세 강도": "하락추세", "상대강도": "약함"}
+_UP_LABEL = {"추세 강도": "상승", "상대강도": "강함"}
+_DN_LABEL = {"추세 강도": "하락", "상대강도": "약함"}
 
 
 def badge(group: str, v: str) -> tuple[str, str]:
@@ -382,10 +382,10 @@ def badge_text(group: str, v: str) -> str:
 
 def _badge_html(group: str, v: str) -> str:
     color, label = badge(group, v)
-    return f"<span class='b b{color}'>{html.escape(label)}</span>"
+    return f"<span class='b b{color}'>{DOT[color]} {html.escape(label)}</span>"
 
 
-_BADGE_CSS = (".ck .b{display:inline-block;min-width:40px;padding:2px 5px;border-radius:4px;font-weight:bold}"
+_BADGE_CSS = (".ck .b{display:inline-block;padding:2px 4px;border-radius:4px;font-weight:bold;white-space:nowrap}"
               + "".join(f".ck .b.b{k}{{background:{BG[k]};color:{FG[k]}}}" for k in BG)
               + ".ck .chg{display:inline-block;outline:2px solid #fbc02d;border-radius:5px}.ck .dot{color:#f9a825}"
               + ".ck td.dt{font-size:12px;line-height:1.45;padding:4px 6px;vertical-align:top;border-bottom:2px solid #fff}")

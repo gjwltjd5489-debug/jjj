@@ -1,4 +1,4 @@
-"""Investing.com 'Historical Data' CSV 로더.
+"""CSV 로더 (Investing.com 'Historical Data' 형식 우선, Yahoo/FDR/FRED/CBOE 형식도 처리).
 
 Investing.com 사이트의 과거 데이터 페이지에서 내려받은 CSV를 읽어
 표준 OHLCV DataFrame(Date 인덱스, 오름차순)으로 변환한다.
@@ -31,6 +31,7 @@ COLUMN_MAP = {
     "vol.": "Volume",
     "volume": "Volume",
     "change %": "Change",
+    "observation_date": "Date",
     # Korean
     "날짜": "Date",
     "종가": "Close",
@@ -112,3 +113,25 @@ def load_investing_csvs(paths: Iterable[str | Path]) -> pd.DataFrame:
     df = pd.concat(frames)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     return df.dropna(subset=["Close"])
+
+
+def load_series_csv(path: str | Path) -> pd.Series:
+    """단일 시계열 CSV (VIX, 금리, 스프레드 등).
+
+    - Investing.com / CBOE / Yahoo 형식: 종가(Price/Close/종가) 컬럼 사용
+    - FRED 형식(observation_date, DGS10): 날짜 다음 컬럼 사용, "." 은 결측
+    """
+    raw = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
+    norm = {re.sub(r"\s+", " ", c.strip().lower()): c for c in raw.columns}
+    date_col = next((norm[k] for k in ("date", "observation_date", "날짜") if k in norm), raw.columns[0])
+    value_col = next((norm[k] for k in ("price", "close", "종가", "adj close") if k in norm), None)
+    if value_col is None:
+        others = [c for c in raw.columns if c != date_col]
+        if not others:
+            raise ValueError(f"{path}: 값 컬럼이 없습니다")
+        value_col = others[0]
+    s = pd.Series(raw[value_col].map(_parse_number).to_numpy(dtype=float),
+                  index=_parse_dates(raw[date_col]), name=Path(path).stem)
+    s.index.name = "Date"
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    return s.dropna()

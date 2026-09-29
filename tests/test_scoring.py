@@ -4,6 +4,7 @@ import pytest
 
 from scoring import compute_score, get_profile, load_investing_csv
 from scoring.indicators import volume_ratio
+from scoring.cards import V0
 from scoring.score import ITEMS
 
 EN_CSV = '''"Date","Price","Open","High","Low","Vol.","Change %"
@@ -100,8 +101,8 @@ def test_warmup_rows_have_no_score():
 
 
 def test_events_are_threshold_crossings():
-    p = get_profile("QQQ")
-    out = compute_score(synthetic(seed=7, drift=0.0005, n=1500), p)
+    p = V0
+    out = compute_score(synthetic(seed=7, drift=0.0005, n=1500), get_profile("QQQ"))
     prev = out["total"].shift(1)
     buys = out[out["event"] == "BUY"]
     sells = out[out["event"] == "SELL"]

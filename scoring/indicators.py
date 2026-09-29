@@ -74,3 +74,69 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> p
     # 초기 slow+signal 구간은 EMA가 안정되지 않았으므로 제외
     out.iloc[: slow + signal] = np.nan
     return out
+
+
+def _wilder(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    prev = df["Close"].shift(1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - prev).abs(), (df["Low"] - prev).abs()], axis=1).max(axis=1)
+    return _wilder(tr.where(prev.notna()), period)
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Wilder DMI/ADX. 반환: plus_di, minus_di, adx."""
+    up = df["High"].diff()
+    down = -df["Low"].diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0).where(up.notna())
+    minus_dm = down.where((down > up) & (down > 0), 0.0).where(down.notna())
+    a = atr(df, period)
+    plus_di = 100 * _wilder(plus_dm, period) / a
+    minus_di = 100 * _wilder(minus_dm, period) / a
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return pd.DataFrame({"plus_di": plus_di, "minus_di": minus_di, "adx": _wilder(dx, period)}, index=df.index)
+
+
+def bollinger_pct_b(close: pd.Series, period: int = 20, k: float = 2.0) -> pd.Series:
+    mid = close.rolling(period).mean()
+    sd = close.rolling(period).std(ddof=0)
+    return (close - (mid - k * sd)) / (2 * k * sd)
+
+
+def realized_vol(close: pd.Series, period: int = 20) -> pd.Series:
+    """연율화 실현변동성."""
+    return np.log(close).diff().rolling(period).std() * np.sqrt(252)
+
+
+def rolling_pct_rank(series: pd.Series, window: int = 252) -> pd.Series:
+    """직전 window 일 중 오늘 값의 백분위(0~1). 과거 값만 사용."""
+    return series.rolling(window).rank(pct=True)
+
+
+def drawdown(close: pd.Series, window: int = 252) -> pd.Series:
+    """window 일 최고 종가 대비 하락률 (0 이하)."""
+    return close / close.rolling(window).max() - 1
+
+
+def distribution_days(df: pd.DataFrame, lookback: int = 25, min_drop: float = 0.002) -> pd.Series:
+    """최근 lookback 일 중 '거래량 증가 + 0.2% 이상 하락'한 날 수 (IBD 방식 분산일)."""
+    ret = df["Close"].pct_change()
+    vol = df["Volume"]
+    dist = ((ret <= -min_drop) & (vol > vol.shift(1))).astype(float)
+    valid = vol.notna() & vol.shift(1).notna() & ret.notna()
+    dist = dist.where(valid)
+    return dist.rolling(lookback).sum()
+
+
+def momentum_12_1(close: pd.Series, long: int = 252, skip: int = 21) -> pd.Series:
+    """12-1개월 모멘텀: 최근 1개월을 제외한 12개월 수익률."""
+    return close.shift(skip) / close.shift(long) - 1
+
+
+def down_streak(close: pd.Series) -> pd.Series:
+    """연속 하락일 수."""
+    down = close.diff() < 0
+    groups = (~down).cumsum()
+    return down.astype(int).groupby(groups).cumsum().astype(float).where(close.diff().notna())

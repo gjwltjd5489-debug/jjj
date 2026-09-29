@@ -1,7 +1,8 @@
 """종목별 점수 파라미터(프로파일).
 
-다른 종목으로 확장할 때는 DEFAULT를 복사해 기간/구간/임계값만 바꿔 PROFILES에 등록한다.
+다른 종목으로 확장할 때는 DEFAULT를 복사해 기간/구간만 바꿔 PROFILES에 등록한다.
 구간(bands)은 [(상한, 점수), ...] 형태이며, 값이 상한 '미만'인 첫 구간의 점수를 준다.
+여기는 지표 계산 파라미터만 둔다. 점수 배분과 신호 임계값은 scoring/cards.py 의 카드별로 정한다.
 """
 
 from __future__ import annotations
@@ -41,11 +42,16 @@ class Profile:
     macd_slow: int = 26
     macd_signal: int = 9
 
-    # 신호 구간 (총점 기준)
-    strong_buy: float = 80
-    buy: float = 65
-    sell: float = 35
-    strong_sell: float = 20
+    # v1~v4 추가 지표
+    adx_period: int = 14
+    bb_period: int = 20
+    vol_period: int = 20          # 실현변동성 기간
+    pct_window: int = 252         # 백분위 계산 창 (1년)
+    dd_window: int = 252          # 고점 대비 낙폭 창 (52주)
+    dist_lookback: int = 25       # 분산일 집계 기간
+    rs_ma: int = 50               # 상대강도 비율 이평
+    rs_lookback: int = 63         # 상대수익 비교 기간 (3개월)
+    benchmark: str = "SPY"        # 상대강도 비교 대상 (참고용 이름)
 
     notes: str = field(default="", compare=False)
 
@@ -59,7 +65,7 @@ QQQ = replace(
 )
 
 # 확장 예시: 한국 지수/종목은 5/20/60/120 관례를 따르므로 20/60/120으로 시작
-KOSPI = replace(DEFAULT, name="KOSPI", ma_short=20, ma_mid=60, ma_long=120,
+KOSPI = replace(DEFAULT, name="KOSPI", ma_short=20, ma_mid=60, ma_long=120, benchmark="KS11",
                 notes="한국 관례 이평(20/60/120). 지수는 거래량이 없을 수 있음")
 
 PROFILES = {p.name: p for p in (DEFAULT, QQQ, KOSPI)}

@@ -2,6 +2,9 @@ group,ticker,name
 지수,SPY,S&P 500
 지수,QQQ,나스닥100
 지수,IWM,러셀2000
+해외 증시,EWY,한국 (iShares MSCI Korea)
+해외 증시,EWJ,일본 (iShares MSCI Japan)
+해외 증시,MCHI,중국 (iShares MSCI China)
 자산배분,VWO,신흥국
 자산배분,GLD,금
 자산배분,PDBC,원자재

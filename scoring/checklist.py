@@ -251,32 +251,35 @@ def render_html(reports: list[TickerReport]) -> str:
     date = max(r.date for r in reports).date()
     total = len(reports[0].checks)
     e = html.escape
-    td = 'style="padding:4px 8px;border-bottom:1px solid #ddd;text-align:center;white-space:nowrap"'
-    tdl = 'style="padding:4px 8px;border-bottom:1px solid #ddd;text-align:left;white-space:nowrap"'
-    th = 'style="padding:6px 8px;background:#f2f2f2;border-bottom:2px solid #999;white-space:nowrap"'
-    parts = ['<div style="font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222">',
-             f"<h2 style='margin:0 0 8px'>미국장 지표 체크리스트 <span style='font-weight:normal;color:#666'>({date} 종가)</span></h2>"]
+    td, tdl = 'class="c"', 'class="l"'
+    parts = ["<style>.ck{font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222}"
+             ".ck table{border-collapse:collapse}.ck th{padding:6px 8px;background:#f2f2f2;border-bottom:2px solid #999;"
+             "white-space:nowrap}.ck td{padding:4px 8px;border-bottom:1px solid #ddd;white-space:nowrap}"
+             ".ck td.c{text-align:center}.ck td.l{text-align:left}.ck td.d{white-space:normal;font-size:13px}"
+             ".ck .g{font-weight:bold;color:#555;padding-top:8px}.ck .m{color:#777}</style>",
+             '<div class="ck">',
+             f"<h2 style='margin:0 0 8px'>미국장 지표 체크리스트 <span class='m' style='font-weight:normal'>({date} 종가)</span></h2>"]
     heads = _headline(reports)
     if heads:
         parts.append("<ul style='margin:4px 0 12px;padding-left:20px'>" + "".join(f"<li>{e(h)}</li>" for h in heads) + "</ul>")
-    parts.append("<table style='border-collapse:collapse'><tr>")
+    parts.append("<table><tr>")
     for h in ["종목", "종가", "등락", "고점대비"] + [g for g, _ in COLUMNS] + ["✅/❌"]:
-        parts.append(f"<th {th}>{e(h)}</th>")
+        parts.append(f"<th>{e(h)}</th>")
     parts.append("</tr>")
     group = None
     ncol = 5 + len(COLUMNS)
     for r in reports:
         if r.group and r.group != group:
             group = r.group
-            parts.append(f"<tr><td colspan='{ncol}' style='padding:8px 8px 2px;font-weight:bold;color:#555'>{e(group)}</td></tr>")
+            parts.append(f"<tr><td colspan='{ncol}' class='g'>{e(group)}</td></tr>")
         color = "#c62828" if r.change > 0 else "#1565c0" if r.change < 0 else "#222"
         parts.append("<tr>")
-        parts.append(f"<td {tdl}><b>{e(r.ticker)}</b> <span style='color:#777'>{e(r.name)}</span></td>")
+        parts.append(f"<td {tdl}><b>{e(r.ticker)}</b> <span class='m'>{e(r.name)}</span></td>")
         parts.append(f"<td {td}>{r.close:,.2f}</td><td {td}><span style='color:{color}'>{r.change:+.1%}</span></td>")
         parts.append(f"<td {td}>{r.from_high:+.1%}</td>")
         for _, names in COLUMNS:
             parts.append(f"<td {td}>{_cell(r, names)}</td>")
-        parts.append(f"<td {td}>{r.ups}/{r.downs} <span style='color:#999'>({total})</span></td></tr>")
+        parts.append(f"<td {td}>{r.ups}/{r.downs} <span class='m'>({total})</span></td></tr>")
     parts.append("</table>")
     parts.append("<h3 style='margin:16px 0 4px'>오늘의 이벤트</h3>")
     evs = [r for r in reports if r.events]
@@ -285,10 +288,10 @@ def render_html(reports: list[TickerReport]) -> str:
                      "".join(f"<li><b>{e(r.ticker)}</b>: {e(', '.join(r.events))}</li>" for r in evs) + "</ul>")
     else:
         parts.append("<p style='margin:0'>없음</p>")
-    parts.append("<h3 style='margin:16px 0 4px'>상세</h3><table style='border-collapse:collapse;font-size:13px'>")
+    parts.append("<h3 style='margin:16px 0 4px'>상세</h3><table>")
     for r in reports:
         detail = " · ".join(f"{c.name} {c.status} {c.detail}" for c in r.checks)
-        parts.append(f"<tr><td {tdl}><b>{e(r.ticker)}</b></td><td style='padding:4px 8px;border-bottom:1px solid #eee'>{e(detail)}</td></tr>")
+        parts.append(f"<tr><td {tdl}><b>{e(r.ticker)}</b></td><td class='d'>{e(detail)}</td></tr>")
     parts.append("</table>")
     parts.append(f"<p style='color:#777;font-size:12px;margin-top:16px'>{e(LEGEND)}</p></div>")
     return "".join(parts)

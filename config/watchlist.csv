@@ -1,0 +1,16 @@
+group,ticker,name
+지수,SPY,S&P 500
+지수,QQQ,나스닥100
+지수,IWM,러셀2000
+자산배분,VWO,신흥국
+자산배분,GLD,금
+자산배분,PDBC,원자재
+자산배분,EDV,초장기국채
+자산배분,UUP,달러
+빅테크,AAPL,애플
+빅테크,MSFT,마이크로소프트
+빅테크,NVDA,엔비디아
+빅테크,AMZN,아마존
+빅테크,GOOGL,알파벳
+빅테크,META,메타
+빅테크,TSLA,테슬라

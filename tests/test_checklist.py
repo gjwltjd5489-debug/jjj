@@ -1,0 +1,30 @@
+import numpy as np
+
+from scoring import get_profile
+from scoring.checklist import DOWN, NEUTRAL, UP, build_report, render_html, render_markdown
+from tests.test_scoring import synthetic
+
+P = get_profile("QQQ")
+
+
+def test_uptrend_mostly_bullish_and_renders():
+    up = build_report(synthetic(n=600, drift=0.003, seed=1), P, "UP", "상승", "테스트")
+    down = build_report(synthetic(n=600, drift=-0.003, seed=1), P, "DN", "하락", "테스트")
+    assert up.ups >= 8 and down.downs >= 8
+    assert up.check("200일선").status == UP and down.check("200일선").status == DOWN
+    md = render_markdown([up, down])
+    page = render_html([up, down])
+    assert "| UP |" in md and "오늘의 이벤트" in md
+    assert "<table" in page and "UP" in page
+
+
+def test_missing_volume_marks_neutral():
+    r = build_report(synthetic(n=600, seed=2).assign(Volume=np.nan), P, "IDX")
+    assert r.check("VR(20)").status == NEUTRAL
+
+
+def test_detects_20ma_breakout_event():
+    df = synthetic(n=400, drift=-0.001, seed=4)
+    df.iloc[-1, df.columns.get_loc("Close")] = df["Close"].iloc[-30:].max() * 1.1
+    r = build_report(df, P, "X")
+    assert "20일선 상향 돌파" in r.events

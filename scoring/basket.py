@@ -60,10 +60,11 @@ def combined_corr(ret_c: pd.DataFrame, sc_c: pd.DataFrame, weight: float = 0.5) 
     return weight * ret_c.loc[idx, idx] + (1 - weight) * sc_c.loc[idx, idx]
 
 
-def select_low_corr(corr: pd.DataFrame, k: int, must: tuple[str, ...] = ()) -> list[str]:
+def select_low_corr(corr: pd.DataFrame, k: int, must: tuple[str, ...] = (), max_pair: float = 0.8) -> list[str]:
     """탐욕법: 이미 고른 종목들과의 평균 상관이 가장 낮은 후보를 하나씩 추가.
 
     must 가 없으면 전체에서 상관이 가장 낮은 쌍으로 시작한다. 음(-)의 상관은 분산 효과가 크므로 그대로 반영한다.
+    이미 고른 종목 중 하나와라도 상관이 max_pair 를 넘는 후보(예: TLT 와 EDV)는 제외한다.
     """
     names = [n for n in corr.index if corr.loc[n].notna().sum() > 1]
     chosen = [m for m in must if m in names]
@@ -72,7 +73,9 @@ def select_low_corr(corr: pd.DataFrame, k: int, must: tuple[str, ...] = ()) -> l
         a, b = c.stack().idxmin()
         chosen = [a, b]
     while len(chosen) < min(k, len(names)):
-        rest = [n for n in names if n not in chosen]
+        rest = [n for n in names if n not in chosen and not (corr.loc[n, chosen] > max_pair).any()]
+        if not rest:
+            break
         avg = corr.loc[rest, chosen].mean(axis=1)
         worst = corr.loc[rest, chosen].max(axis=1)
         pick = pd.DataFrame({"avg": avg, "max": worst}).sort_values(["avg", "max"]).index[0]

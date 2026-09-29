@@ -93,6 +93,7 @@ def main() -> None:
     ap.add_argument("--select-from", nargs="+", help="후보 종목: 상관 낮은 k 개를 자동 선정")
     ap.add_argument("--k", type=int, default=6, help="자동 선정 종목 수")
     ap.add_argument("--must", nargs="*", default=[], help="자동 선정 시 반드시 포함할 종목")
+    ap.add_argument("--max-pair", type=float, default=0.8, help="선정 시 종목 쌍 상관 상한 (중복 자산 제외)")
     ap.add_argument("--corr-weight", type=float, default=0.5, help="선정 기준: 수익률 상관 비중 (나머지는 점수 상관)")
     ap.add_argument("--top", type=int, default=2, help="보유 종목 수 n")
     ap.add_argument("--rebalance", type=int, default=5, help="교체 판단 주기(거래일, 기본 5 = 주 1회)")
@@ -148,7 +149,7 @@ def main() -> None:
     out("\n## 상관관계 (v2 추세 점수)")
     out(sc.round(2).to_string())
     if select_from:
-        chosen = select_low_corr(cc, k, tuple(must))
+        chosen = select_low_corr(cc, k, tuple(must), args.max_pair)
         out(f"\n## 선정 (수익률 {args.corr_weight:.0%} + 점수 {1 - args.corr_weight:.0%} 상관 기준, {k}개)")
         out(f"  {' '.join(chosen)}  (평균 상관 {avg_offdiag(cc, chosen):.2f}, 전체 후보 평균 {avg_offdiag(cc, list(cc.index)):.2f})")
     else:

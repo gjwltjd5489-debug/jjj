@@ -119,6 +119,12 @@ def test_select_low_corr_prefers_negative_and_must():
     assert avg_offdiag(c, ["Q", "B"]) == pytest.approx(-0.3)
 
 
+def test_select_low_corr_skips_near_duplicates():
+    names = ["Q", "T", "E", "G"]
+    c = pd.DataFrame([[1, -.2, -.2, .1], [-.2, 1, .95, .2], [-.2, .95, 1, .2], [.1, .2, .2, 1]], index=names, columns=names)
+    assert select_low_corr(c, 3, ("Q",)) == ["Q", "T", "G"]
+
+
 def test_return_corr_weekly():
     idx = pd.bdate_range("2020-01-01", periods=400)
     rng = np.random.default_rng(0)

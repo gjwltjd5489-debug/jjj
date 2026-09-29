@@ -20,7 +20,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scoring import get_profile  # noqa: E402
-from scoring.cards import CARDS, CATEGORY_NAMES, get_card  # noqa: E402
+from scoring.cards import CARDS, CATEGORY_NAMES, COMBOS, get_card  # noqa: E402
 from scoring.evaluate import band_stats, fmt_pct, strategy_stats  # noqa: E402
 from scoring.score import breakdown, compute_all  # noqa: E402
 from scoring.sources import load_prices, load_series  # noqa: E402
@@ -51,7 +51,29 @@ def pick_row(out: pd.DataFrame, date: str | None) -> pd.Series | None:
     return valid.loc[:date].iloc[-1] if date else valid.iloc[-1]
 
 
+def print_combo(out: pd.DataFrame, name: str, date: str | None) -> None:
+    combo = COMBOS[name]
+    row = pick_row(out, date)
+    if row is None:
+        print("점수를 계산할 만큼 데이터가 없습니다.")
+        return
+    held = row["state"] == 1
+    print(f"\n== {combo.title}")
+    print(f"[{row.name.date()}] 종가 {row['close']:.2f}  점수 {row['total']:.1f}  → {row['signal']}"
+          f"  ({'보유 자격 있음' if held else '대기'})")
+    print(f"  {combo.entry} 눌림 점수 {row[combo.entry]:.1f} (진입: {combo.entry_level:.0f} 상향 돌파"
+          + (f" 또는 {combo.exit} {combo.trend_entry:.0f} 상향 돌파" if combo.trend_entry else "") + ")")
+    print(f"  {combo.exit} 추세 점수 {row[combo.exit]:.1f} (청산: {combo.exit_level:.0f} 이하)")
+    last = out.loc[:row.name]
+    ev = last[last["event"] != ""].tail(1)
+    if not ev.empty:
+        print(f"  마지막 신호: {ev.index[-1].date()} {ev['event'].iloc[-1]}")
+
+
 def print_card(out: pd.DataFrame, card_name: str, date: str | None) -> None:
+    if card_name in COMBOS:
+        print_combo(out, card_name, date)
+        return
     card = get_card(card_name)
     row = pick_row(out, date)
     if row is None:
@@ -96,7 +118,7 @@ def print_eval(out: pd.DataFrame) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="100점 매수/매도 점수")
     add_data_args(ap)
-    ap.add_argument("--card", default="v0", help=f"카드 ({', '.join(CARDS)}, all)")
+    ap.add_argument("--card", default="v0", help=f"카드 ({', '.join(list(CARDS) + list(COMBOS))}, all)")
     ap.add_argument("--date", help="해당 날짜(또는 직전 거래일) 점수표 출력")
     ap.add_argument("--eval", action="store_true", help="점수 구간별 이후 수익률·전략 성과 출력")
     ap.add_argument("--out", help="결과 CSV 저장 경로 (카드 하나일 때)")
@@ -108,7 +130,7 @@ def main() -> None:
           + (f"  벤치마크 {len(bench)}행" if bench is not None else "")
           + (f"  외부: {', '.join(ext)}" if ext else ""))
 
-    names = list(CARDS) if args.card == "all" else [args.card]
+    names = list(CARDS) + list(COMBOS) if args.card == "all" else [args.card]
     results = compute_all(df, profile, names, bench, ext)
 
     if len(names) > 1:
@@ -116,8 +138,9 @@ def main() -> None:
         for name, out in results.items():
             row = pick_row(out, args.date)
             if row is not None:
+                title = COMBOS[name].title if name in COMBOS else get_card(name).title
                 rows.append({"card": name, "date": row.name.date(), "total": row["total"],
-                             "signal": row["signal"], "title": get_card(name).title})
+                             "signal": row["signal"], "title": title})
         print()
         print(pd.DataFrame(rows).to_string(index=False))
     for name, out in results.items():

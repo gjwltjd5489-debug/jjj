@@ -337,8 +337,42 @@ def get_card(name: str) -> Card:
     try:
         return CARDS[name.lower()]
     except KeyError:
-        raise ValueError(f"알 수 없는 카드: {name} (가능: {', '.join(CARDS)})") from None
+        raise ValueError(f"알 수 없는 카드: {name} (가능: {', '.join(CARDS)}, {', '.join(COMBOS)})") from None
 
 
 for _card in CARDS.values():
     assert abs(sum(it.max for it in _card.items) - 100) < 1e-9, _card.name
+
+
+# ---------------------------------------------------------------- v5 조합형 (v3 진입 + v2 청산)
+
+@dataclass(frozen=True)
+class Combo:
+    """진입 카드와 청산 카드를 묶은 상태 기계.
+
+    - 진입: 대기 상태에서 entry 카드 점수가 entry_level 을 상향 돌파하고, 청산 조건이 아닐 때
+    - 청산: 보유 상태에서 exit 카드 점수(평활)가 exit_level 이하
+    - 점수(순위용 100점) = 보유 자격 50 + 추세 점수(v2)의 절반 50
+      rank="v2v3" 이면 50 + (v2 + v3) / 4
+    - trend_entry 가 있으면 청산 카드 점수가 그 값을 상향 돌파할 때도 진입 (눌림 없이 오르는 추세 대응)
+    """
+
+    name: str
+    title: str
+    entry: str = "v3"
+    exit: str = "v2"
+    entry_level: float = 65
+    exit_level: float = 40
+    rank: str = "v2"
+    trend_entry: float | None = None
+    strong_buy: float = 90     # 보유 중 & v2 ≥ 80
+    buy: float = 50            # 보유 중
+    sell: float = 20           # 대기 & v2 ≤ 40
+    strong_sell: float = 12.5  # 대기 & v2 ≤ 25
+    smooth: int = 1
+
+
+V5 = Combo(name="v5", title="v5 조합형 (v3 눌림목 진입 + v2 추세 이탈 청산)")
+V6 = Combo(name="v6", title="v6 조합형 (v3 눌림목 또는 v2 추세 확인 진입 + v2 청산)", trend_entry=70)
+
+COMBOS = {c.name: c for c in (V5, V6)}

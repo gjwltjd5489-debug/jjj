@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
-from .cards import OPTIONAL, V0, Card, get_card
+from .cards import COMBOS, OPTIONAL, V0, Card, Combo, get_card
 from .profiles import Profile
 
 LABELS = ("강한 매도", "매도", "중립", "매수", "강한 매수")
@@ -83,7 +83,7 @@ def compute_indicators(df: pd.DataFrame, p: Profile, bench: pd.Series | None = N
     return out
 
 
-def label(total: float, card: Card) -> str | None:
+def label(total: float, card: Card | Combo) -> str | None:
     if pd.isna(total):
         return None
     if total >= card.strong_buy:
@@ -156,16 +156,77 @@ def compute_score(df: pd.DataFrame, p: Profile, card: Card | str = V0,
     optional 카테고리(거래량/상대강도/매크로)는 데이터가 없으면 빼고, 남은 만점 기준으로 100점 환산한다.
     total_s 는 카드의 smooth 기간 이동평균 점수이며 signal/event 는 total_s 기준이다.
     """
+    if isinstance(card, str) and card in COMBOS:
+        return compute_all(df, p, [card], bench, ext)[card]
     if isinstance(card, str):
         card = get_card(card)
     x = compute_indicators(df, p, bench, ext)
     return score_with_indicators(x, p, card)
 
 
+def combine(entry: pd.DataFrame, exit_: pd.DataFrame, combo: Combo) -> pd.DataFrame:
+    """진입 카드(v3) BUY 돌파로 들어가고 청산 카드(v2) 점수가 청산선 이하면 나오는 상태 기계.
+
+    각 카드 자체의 BUY/SELL 교대 규칙과 무관하게 점수 수준으로 판단한다
+    (예: v2 가 이미 SELL 을 낸 뒤 다시 40 아래로 가도 청산되도록).
+    """
+    e = entry["total_s"].to_numpy()
+    x = exit_["total_s"].to_numpy()
+    state = np.full(len(e), np.nan)
+    events = [""] * len(e)
+    cur = 0.0
+    started = False
+    for k in range(len(e)):
+        if np.isnan(x[k]):
+            if started:
+                state[k] = cur
+            continue
+        started = True
+        pullback = k > 0 and not np.isnan(e[k]) and not np.isnan(e[k - 1]) and e[k] >= combo.entry_level > e[k - 1]
+        trend = combo.trend_entry is not None and k > 0 and not np.isnan(x[k - 1]) \
+            and x[k] >= combo.trend_entry > x[k - 1]
+        if cur == 0 and (pullback or trend) and x[k] > combo.exit_level:
+            cur = 1.0
+            events[k] = "BUY"
+        elif cur == 1 and x[k] <= combo.exit_level:
+            cur = 0.0
+            events[k] = "SELL"
+        state[k] = cur
+
+    out = exit_[["close"]].copy()
+    out[combo.exit] = exit_["total_s"]
+    out[combo.entry] = entry["total_s"]
+    out["state"] = state
+    trend = exit_["total_s"]
+    if combo.rank == "v2v3":
+        rank_part = (trend + entry["total_s"]) / 4
+    else:
+        rank_part = trend / 2
+    out["total"] = (50 * out["state"] + rank_part).round(1)
+    out["total_s"] = out["total"]
+    out["signal"] = out["total_s"].map(lambda t: label(t, combo))
+    out["event"] = pd.Series(events, index=out.index)
+    out["max_used"] = exit_["max_used"]
+    return out
+
+
 def compute_all(df: pd.DataFrame, p: Profile, cards, bench=None, ext=None) -> dict[str, pd.DataFrame]:
-    """여러 카드를 지표 1회 계산으로 평가."""
+    """여러 카드(조합 카드 포함)를 지표 1회 계산으로 평가."""
     x = compute_indicators(df, p, bench, ext)
-    return {c.name: score_with_indicators(x, p, c) for c in (get_card(c) if isinstance(c, str) else c for c in cards)}
+    names = [c if isinstance(c, str) else c.name for c in cards]
+    needed = []
+    for n in names:
+        parts = [COMBOS[n].entry, COMBOS[n].exit] if n in COMBOS else [n]
+        needed += [q for q in parts if q not in needed]
+    base = {n: score_with_indicators(x, p, get_card(n)) for n in needed}
+    out = {}
+    for n in names:
+        if n in COMBOS:
+            c = COMBOS[n]
+            out[n] = combine(base[c.entry], base[c.exit], c)
+        else:
+            out[n] = base[n]
+    return out
 
 
 def breakdown(row: pd.Series, card: Card | str = V0) -> pd.DataFrame:

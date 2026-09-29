@@ -7,6 +7,7 @@
 | Investing.com 데이터를 그대로 | 웹에서 **CSV 다운로드** (가장 확실) | FinanceDataReader `fdr:INVESTING:QQQ` (비공식) |
 | 금리·스프레드·VIX | **FRED** `fdr:FRED:DGS10`, `fdr:FRED:BAMLH0A0HYM2`, `fdr:FRED:VIXCLS` | CBOE VIX_History.csv |
 | 한국 종목·지수 | **FinanceDataReader** `fdr:005930` (네이버 경유) | 한국투자증권 KIS Open API(공식), pykrx(KRX 로그인 필요) |
+| 인터넷 없이 실험 | `sample:` (arch·zipline 패키지 내장 실제 데이터) | 나스닥·S&P500·VIX·WTI 1999~2018, 국채금리 1990~2017 |
 
 이 저장소의 스크립트는 모두 지원한다:
 ```bash

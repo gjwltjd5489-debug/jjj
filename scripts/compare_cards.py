@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_score import add_data_args, load_inputs  # noqa: E402
 
 from scoring import get_profile  # noqa: E402
-from scoring.cards import CARDS  # noqa: E402
+from scoring.cards import CARDS, COMBOS  # noqa: E402
 from scoring.evaluate import fmt_pct, summarize  # noqa: E402
 from scoring.score import compute_all  # noqa: E402
 
@@ -53,7 +53,7 @@ def main() -> None:
     args = ap.parse_args()
 
     df, bench, ext = load_inputs(args)
-    results = compute_all(df, get_profile(args.ticker), list(CARDS), bench, ext)
+    results = compute_all(df, get_profile(args.ticker), list(CARDS) + list(COMBOS), bench, ext)
 
     periods = [("전체", None, None)]
     if args.split:

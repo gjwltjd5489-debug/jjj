@@ -6,9 +6,12 @@ spec 형식
 - "fdr:INVESTING:QQQ"     : FinanceDataReader 의 Investing.com 소스
 - "fdr:005930"            : 한국 종목 (기본 소스 = 네이버)
 - "fdr:FRED:DGS10"        : FRED 시계열 (금리, 스프레드 등)
-- "sample:nasdaq"         : arch 패키지에 들어있는 실제 데이터 (nasdaq / sp500 / vix, 1999~2018)
+- "sample:nasdaq"         : 패키지에 들어있는 실제 데이터 (아래 SAMPLES)
+- "fdr:PDBC+DBC"          : PDBC 상장 전 구간을 DBC 수익률로 이어 붙임 (backfill)
 
-fdr: 은 `pip install finance-datareader`, sample: 은 `pip install arch --no-deps` 가 필요하다.
+fdr: 은 `pip install finance-datareader`,
+sample: 은 `pip install arch --no-deps` (nasdaq/sp500/vix/wti) 와
+`pip install zipline-reloaded --no-deps` (longbond/cash) 가 필요하다.
 """
 
 from __future__ import annotations
@@ -22,14 +25,29 @@ import pandas as pd
 
 from .data import load_investing_csvs, load_series_csv
 
-SAMPLES = {"nasdaq": "NASDAQ Composite 1999~2018", "sp500": "S&P 500 1999~2018", "vix": "VIX 2014~2018"}
+SAMPLES = {
+    "nasdaq": "NASDAQ Composite 1999~2018 (arch)",
+    "sp500": "S&P 500 1999~2018 (arch)",
+    "vix": "VIX 2014~2018 (arch)",
+    "wti": "WTI 원유 현물 1986~2019 (arch, FRED DCOILWTICO)",
+    "longbond": "미 20년물 금리로 만든 합성 초장기채 지수, 듀레이션 24 (zipline 국채금리 1990~2017.3)",
+    "cash": "미 3개월물 금리로 만든 현금 지수 (zipline 국채금리 1990~2017.3)",
+}
+ARCH_SAMPLES = {"nasdaq", "sp500", "vix", "wti"}
+LONGBOND_DURATION = 24.0
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
-def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_ohlcv(df: pd.DataFrame, adjust: bool = True) -> pd.DataFrame:
+    """OHLCV 로 정리. adjust=True 이고 'Adj Close' 가 있으면 시가·고가·저가·종가를 배당/분할 조정한다."""
     df = df.copy()
     df.index = pd.to_datetime(df.index)
     df.index.name = "Date"
+    if adjust and "Adj Close" in df.columns and "Close" in df.columns:
+        ratio = pd.to_numeric(df["Adj Close"], errors="coerce") / pd.to_numeric(df["Close"], errors="coerce")
+        for col in ("Open", "High", "Low", "Close"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce") * ratio
     for col in OHLCV:
         if col not in df.columns:
             df[col] = np.nan
@@ -57,18 +75,58 @@ def fetch_fdr(symbol: str, start: str | None = None, end: str | None = None) -> 
     return df
 
 
-def _sample_path(name: str) -> Path:
-    if name not in SAMPLES:
-        raise ValueError(f"sample:{name} 없음 (가능: {', '.join(SAMPLES)})")
-    spec = importlib.util.find_spec("arch")  # arch 를 import 하지 않고 데이터 파일만 찾는다
+def _package_dir(pkg: str, hint: str) -> Path:
+    spec = importlib.util.find_spec(pkg)  # 패키지를 import 하지 않고 데이터 파일만 찾는다
     if spec is None or not spec.submodule_search_locations:
-        raise RuntimeError("sample: 소스는 `pip install arch --no-deps` 가 필요합니다")
-    return Path(spec.submodule_search_locations[0]) / "data" / name / f"{name}.csv.gz"
+        raise RuntimeError(f"이 샘플은 `{hint}` 가 필요합니다")
+    return Path(spec.submodule_search_locations[0])
+
+
+def _treasury() -> pd.DataFrame:
+    path = _package_dir("zipline", "pip install zipline-reloaded --no-deps") / "resources" / "market_data" / "treasury_curves.csv"
+    t = pd.read_csv(path)
+    t.index = pd.to_datetime(t["Time Period"].str[:10])
+    t.index.name = "Date"
+    return t.drop(columns=["Time Period"]).apply(pd.to_numeric, errors="coerce")
+
+
+def rate_index(yields: pd.Series, duration: float = 0.0, start: float = 100.0) -> pd.Series:
+    """금리(소수) 시계열 → 총수익 지수. 이자(캐리) + 듀레이션·볼록성 가격 효과."""
+    y = yields.dropna()
+    dt = y.index.to_series().diff().dt.days.fillna(0) / 365.0
+    dy = y.diff().fillna(0)
+    ret = y.shift(1).fillna(y.iloc[0]) * dt - duration * dy + 0.5 * duration ** 2 * dy ** 2
+    return start * (1 + ret).cumprod()
 
 
 def load_sample(name: str) -> pd.DataFrame:
-    raw = pd.read_csv(_sample_path(name), parse_dates=["Date"], date_format="%m/%d/%Y").set_index("Date")
-    return raw
+    if name not in SAMPLES:
+        raise ValueError(f"sample:{name} 없음 (가능: {', '.join(SAMPLES)})")
+    if name in ARCH_SAMPLES:
+        path = _package_dir("arch", "pip install arch --no-deps") / "data" / name / f"{name}.csv.gz"
+        raw = pd.read_csv(path, parse_dates=["Date"], date_format="%m/%d/%Y").set_index("Date")
+        if name == "wti":
+            raw = raw.rename(columns={"DCOILWTICO": "Close"})
+            raw["Close"] = pd.to_numeric(raw["Close"], errors="coerce")
+        return raw
+    t = _treasury()
+    if name == "longbond":
+        return pd.DataFrame({"Close": rate_index(t["20year"], LONGBOND_DURATION)})
+    return pd.DataFrame({"Close": rate_index(t["3month"], 0.0)})
+
+
+def splice(primary: pd.DataFrame, proxy: pd.DataFrame) -> pd.DataFrame:
+    """primary 시작 전 구간을 proxy 로 채운다. 가격은 연결 시점에 맞춰 비율 조정(수익률 보존)."""
+    first = primary.index[0]
+    common = proxy.index[proxy.index <= first]
+    if len(common) == 0:
+        return primary
+    anchor = common[-1]
+    scale = primary["Close"].iloc[0] / proxy.loc[anchor, "Close"]
+    before = proxy.loc[proxy.index < first].copy()
+    for col in ("Open", "High", "Low", "Close"):
+        before[col] = before[col] * scale
+    return pd.concat([before, primary])
 
 
 def load_prices(specs: str | Iterable[str], start: str | None = None) -> pd.DataFrame:
@@ -78,10 +136,12 @@ def load_prices(specs: str | Iterable[str], start: str | None = None) -> pd.Data
     if fdr_specs and len(specs) > 1:
         raise ValueError("fdr:/sample: 소스는 하나만 지정하세요")
     if fdr_specs:
-        spec = fdr_specs[0]
-        kind, _, sym = spec.partition(":")
-        df = fetch_fdr(sym, start) if kind == "fdr" else load_sample(sym)
-        df = _normalize_ohlcv(df)
+        kind, _, sym = fdr_specs[0].partition(":")
+        parts = sym.split("+")  # "PDBC+DBC": 뒤 심볼로 앞 심볼 상장 전 구간 채우기
+        frames = [_normalize_ohlcv(fetch_fdr(q, start) if kind == "fdr" else load_sample(q)) for q in parts]
+        df = frames[0]
+        for proxy in frames[1:]:
+            df = splice(df, proxy)
     else:
         df = load_investing_csvs(specs)
     return df.loc[start:] if start else df

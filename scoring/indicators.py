@@ -35,6 +35,9 @@ def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
 
 
+VR_CAP = 1000.0
+
+
 def volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.Series:
     """VR(%) = (상승일 거래량 + 보합일 거래량/2) / (하락일 거래량 + 보합일 거래량/2) * 100."""
     diff = df["Close"].diff()
@@ -44,6 +47,8 @@ def volume_ratio(df: pd.DataFrame, period: int = 20) -> pd.Series:
     flat = vol.where(diff == 0, 0.0).rolling(period).sum()
     denom = down + flat / 2
     vr = (up + flat / 2) / denom.replace(0, np.nan) * 100
+    # 20일 내내 하락일이 없으면(강한 상승) 분모가 0 → 비워 두지 않고 상한값으로 둔다
+    vr = vr.where(~((denom == 0) & (up > 0)), VR_CAP)
     # 첫 행(diff 없음)이 창에 포함되는 구간과 거래량 결측 구간은 NaN
     valid = diff.notna().astype(float).rolling(period).sum().eq(period) & vol.notna().rolling(period).sum().eq(period)
     return vr.where(valid)

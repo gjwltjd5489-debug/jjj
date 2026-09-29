@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 from scoring import get_profile
-from scoring.checklist import DOWN, NEUTRAL, UP, build_report, render_html, render_markdown
+from scoring.checklist import DOWN, UP, build_report, render_html, render_markdown
 from tests.test_scoring import synthetic
 
 P = get_profile("QQQ")
@@ -20,17 +20,18 @@ def smooth(drift, n=600, seed=0):
 def test_uptrend_mostly_bullish_and_renders():
     up = build_report(smooth(0.002), P, "UP", "상승", "테스트")
     down = build_report(smooth(-0.002), P, "DN", "하락", "테스트")
-    assert up.ups >= 8 and down.downs >= 8
+    assert up.ups >= 3 and down.downs >= 4
     assert up.check("200일선").status == UP and down.check("200일선").status == DOWN
+    assert up.verdicts()["장기 추세"] == "↑" and down.verdicts()["장기 추세"] == "↓"
     md = render_markdown([up, down])
     page = render_html([up, down])
-    assert "| UP |" in md and "오늘의 이벤트" in md
+    assert "| UP |" in md and "오늘의 이벤트" in md and "성향별 판정" in md
     assert "<table" in page and "UP" in page
 
 
 def test_missing_volume_marks_neutral():
     r = build_report(synthetic(n=600, seed=2).assign(Volume=np.nan), P, "IDX")
-    assert r.check("VR(20)").status == NEUTRAL
+    assert r.check("VR").na and r.verdicts()["거래량"] == "–"
 
 
 def test_detects_20ma_breakout_event():
@@ -75,7 +76,8 @@ def test_changes_vs_previous_session():
     df.iloc[-1, df.columns.get_loc("Close")] = df["Close"].iloc[-2] * 0.9   # 마지막 날 급락
     r = build_with_history(df, P, "X")
     names = {now.name for _, now in r.changes}
-    assert "20일선" in names and r.prev_ups > r.ups
+    assert "구름" in names or "전환/기준" in names or "RSI" in names
+    assert r.prev_ups > r.ups
 
 
 def test_data_issues_jump_volume_and_stale():
@@ -103,3 +105,35 @@ def test_subjects_and_plain_text():
     assert make_subject([r], normal).startswith("[점검 필요]")
     text = render_text([r], normal)
     assert "**" not in text and "|" not in text and "#" not in text
+
+
+def test_v2_groups_are_one_or_two_items_and_no_duplicates():
+    from scoring.checklist import GROUPS
+    names = [n for _, items, _ in GROUPS for n in items]
+    assert len(names) == len(set(names)) and all(1 <= len(items) <= 2 for _, items, _ in GROUPS)
+    r = build_report(smooth(0.002), P, "UP")
+    assert {c.name for c in r.checks} == set(names)
+    assert "%B" not in names and "50일선" not in names  # 중복 항목 제거
+
+
+def test_relative_strength_needs_benchmark():
+    df = smooth(0.002)
+    no = build_report(df, P, "A")
+    assert no.verdicts()["상대강도"] == "–"
+    weak_bench = df["Close"] * 0.5
+    strong_bench = pd.Series(100 * np.exp(np.linspace(0, 3, len(df))), index=df.index)
+    assert build_report(df, P, "A", bench=weak_bench).check("상대강도").status in (UP, DOWN)
+    assert build_report(df, P, "A", bench=strong_bench).verdicts()["상대강도"] == "↓"
+
+
+def test_rsi_overbought_is_not_a_warning():
+    df = smooth(0.004)
+    r = build_report(df, P, "X")
+    rsi = r.check("RSI")
+    assert rsi.status == UP  # 강한 추세의 RSI≥70 은 ⚠️ 가 아니라 ✅
+
+
+def test_vr_capped_when_no_down_days():
+    from scoring.indicators import VR_CAP, volume_ratio
+    df = pd.DataFrame({"Close": np.arange(1, 30, dtype=float), "Volume": 1.0})
+    assert volume_ratio(df, 20).iloc[-1] == VR_CAP

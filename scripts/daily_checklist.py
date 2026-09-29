@@ -1,4 +1,4 @@
-"""미국장 마감 후 주요 종목 지표 체크리스트 (RSI, 볼린저, MACD, 일목, VR, OBV, 이동평균).
+"""미국장 마감 후 주요 종목 지표 체크리스트 v2 (성향별 판정: 장기·중기 추세, 모멘텀, 추세 강도, 거래량, 상대강도, 변동성, 과열).
 
 - 직전 거래일과 비교해 바뀐 항목을 강조한다.
 - 데이터를 점검한다: 기준일 지연, 급변, 거래량 누락, 계산 안 된 지표.
@@ -48,19 +48,32 @@ def main() -> None:
     status = session_status(now)
 
     if args.tickers:
-        wl = pd.DataFrame({"group": "", "ticker": args.tickers, "name": ""})
+        wl = pd.DataFrame({"group": "", "ticker": args.tickers, "name": "", "bench": "SPY"})
     else:
         wl = pd.read_csv(args.watchlist, dtype=str).fillna("")
+    if "bench" not in wl.columns:
+        wl["bench"] = ""
     start = (pd.Timestamp.today() - pd.DateOffset(years=args.years)).strftime("%Y-%m-%d")
+
+    cut = pd.Timestamp(status["target"]) if now else None  # --now 로 과거 시점을 흉내 낼 때는 그 시점까지만
+    benches: dict[str, pd.Series | None] = {}
+
+    def bench_for(sym: str, ticker: str) -> pd.Series | None:
+        if not sym or sym == ticker:
+            return None
+        if sym not in benches:
+            try:
+                benches[sym] = load_prices(args.source.format(t=sym), start)["Close"].loc[:cut]
+            except Exception:
+                benches[sym] = None
+        return benches[sym]
 
     reports, failed = [], []
     for row in wl.itertuples(index=False):
         try:
-            df = load_prices(args.source.format(t=row.ticker), start)
-            # --now 로 과거 시점을 흉내 낼 때는 그 시점까지의 데이터만 쓴다
-            df = df.loc[: pd.Timestamp(status["target"])] if now else df
+            df = load_prices(args.source.format(t=row.ticker), start).loc[:cut]
             reports.append(build_with_history(df, get_profile(row.ticker), row.ticker, row.name, row.group,
-                                              expected=status["target"]))
+                                              expected=status["target"], bench=bench_for(row.bench, row.ticker)))
         except Exception as e:  # 한 종목 실패가 전체를 막지 않게
             failed.append(f"{row.ticker} ({type(e).__name__}: {e})")
     if not reports:

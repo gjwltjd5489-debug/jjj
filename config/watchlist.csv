@@ -1,19 +1,19 @@
-group,ticker,name
-지수,SPY,S&P 500
-지수,QQQ,나스닥100
-지수,IWM,러셀2000
-해외 증시,EWY,한국 (iShares MSCI Korea)
-해외 증시,EWJ,일본 (iShares MSCI Japan)
-해외 증시,MCHI,중국 (iShares MSCI China)
-자산배분,VWO,신흥국
-자산배분,GLD,금
-자산배분,PDBC,원자재
-자산배분,EDV,초장기국채
-자산배분,UUP,달러
-빅테크,AAPL,애플
-빅테크,MSFT,마이크로소프트
-빅테크,NVDA,엔비디아
-빅테크,AMZN,아마존
-빅테크,GOOGL,알파벳
-빅테크,META,메타
-빅테크,TSLA,테슬라
+group,ticker,name,bench
+지수,SPY,S&P 500,
+지수,QQQ,나스닥100,SPY
+지수,IWM,러셀2000,SPY
+해외 증시,EWY,한국 (iShares MSCI Korea),SPY
+해외 증시,EWJ,일본 (iShares MSCI Japan),SPY
+해외 증시,MCHI,중국 (iShares MSCI China),SPY
+자산배분,VWO,신흥국,SPY
+자산배분,GLD,금,
+자산배분,PDBC,원자재,
+자산배분,EDV,초장기국채,
+자산배분,UUP,달러,
+빅테크,AAPL,애플,SPY
+빅테크,MSFT,마이크로소프트,SPY
+빅테크,NVDA,엔비디아,SPY
+빅테크,AMZN,아마존,SPY
+빅테크,GOOGL,알파벳,SPY
+빅테크,META,메타,SPY
+빅테크,TSLA,테슬라,SPY

@@ -137,3 +137,23 @@ def test_vr_capped_when_no_down_days():
     from scoring.indicators import VR_CAP, volume_ratio
     df = pd.DataFrame({"Close": np.arange(1, 30, dtype=float), "Volume": 1.0})
     assert volume_ratio(df, 20).iloc[-1] == VR_CAP
+
+
+def test_trade_signal_groups_buy_and_sell():
+    from scoring.checklist import TickerReport, signal_groups
+    base = dict(name="", group="", date=pd.Timestamp("2026-09-29"), close=100.0, change=0.0, from_high=0.0, checks=[])
+    buy = TickerReport(ticker="B", sig={"v2": 72, "v3": 68, "held": True, "event": "BUY", "pullback": True,
+                                        "stop": 95.0, "close": 100.0}, **base)
+    sell = TickerReport(ticker="S", sig={"v2": 38, "v3": 40, "held": False, "event": "SELL", "pullback": False,
+                                         "stop": 90.0, "close": 100.0}, **base)
+    near = TickerReport(ticker="N", sig={"v2": 45, "v3": 40, "held": True, "event": "", "pullback": False,
+                                         "stop": 90.0, "close": 100.0}, **base)
+    g = signal_groups([buy, sell, near])
+    assert [r.ticker for r, _ in g["buy"]] == ["B"] and "눌림목 진입" in g["buy"][0][1] and "-5.0%" in g["buy"][0][1]
+    assert [r.ticker for r, _ in g["sell"]] == ["S"] and [r.ticker for r, _ in g["near_exit"]] == ["N"]
+
+
+def test_trade_signal_on_real_like_series():
+    r = build_with_history(smooth(0.002, n=700), P, "UP")
+    assert r.sig is not None and r.sig["held"] and r.sig["stop"] < r.sig["close"]
+    assert "매수·매도 신호" in render_html([r], {"mode": "normal", "failed": []})

@@ -33,6 +33,20 @@ class TickerReport:
     from_high: float
     checks: list[Check]
     events: list[str] = field(default_factory=list)
+    prev_checks: list[Check] | None = None   # 직전 거래일 체크리스트
+    issues: list[str] = field(default_factory=list)  # 데이터 점검 경고
+
+    @property
+    def changes(self) -> list[tuple[Check, Check]]:
+        """(직전, 오늘) 상태가 바뀐 항목."""
+        if not self.prev_checks:
+            return []
+        prev = {c.name: c for c in self.prev_checks}
+        return [(prev[c.name], c) for c in self.checks if c.name in prev and prev[c.name].status != c.status]
+
+    @property
+    def prev_ups(self) -> int | None:
+        return None if self.prev_checks is None else sum(c.status == UP for c in self.prev_checks)
 
     @property
     def ups(self) -> int:
@@ -183,14 +197,53 @@ def build_report(df: pd.DataFrame, p: Profile, ticker: str, name: str = "", grou
     )
 
 
+# ---------------------------------------------------------------- 직전 거래일 비교 + 데이터 점검
+
+MAX_DAILY_MOVE = 0.25  # 이보다 큰 하루 등락은 분할·데이터 오류 가능성으로 표시
+
+
+def data_issues(df: pd.DataFrame, rep: TickerReport, expected=None) -> list[str]:
+    issues = []
+    last = df.index[-1].date()
+    if expected is not None and last < expected:
+        issues.append(f"기준일 {last} (기대 {expected}) — 데이터 지연")
+    if pd.notna(rep.change) and abs(rep.change) > MAX_DAILY_MOVE:
+        issues.append(f"하루 {rep.change:+.1%} 급변 — 분할·데이터 오류 가능, 원자료 확인 필요")
+    vol = df["Volume"].iloc[-1]
+    if df["Volume"].notna().any() and (pd.isna(vol) or vol <= 0):
+        issues.append("당일 거래량 없음 — VR·OBV 신뢰도 낮음")
+    row = df.iloc[-1]
+    if pd.notna(row["High"]) and pd.notna(row["Low"]) and (
+            row["High"] < row["Low"] or not (row["Low"] * 0.999 <= row["Close"] <= row["High"] * 1.001)):
+        issues.append("고가·저가·종가 불일치")
+    missing = [c.name for c in rep.checks if c.status == NEUTRAL and c.name != "VR(20)"]
+    if missing:
+        issues.append(f"계산 안 된 지표: {', '.join(missing)}")
+    return issues
+
+
+def build_with_history(df: pd.DataFrame, p: Profile, ticker: str, name: str = "", group: str = "",
+                       expected=None) -> TickerReport:
+    """오늘 체크리스트 + 직전 거래일 체크리스트(비교용) + 데이터 점검."""
+    rep = build_report(df, p, ticker, name, group)
+    if len(df) > 2:
+        rep.prev_checks = build_report(df.iloc[:-1], p, ticker, name, group).checks
+    rep.issues = data_issues(df, rep, expected)
+    return rep
+
+
 # ---------------------------------------------------------------- 출력
 
 COLUMNS = [("추세", ["20일선", "50일선", "200일선", "배열"]), ("일목", ["구름", "전환/기준", "후행스팬"]),
            ("MACD", ["시그널", "0선"]), ("RSI", ["RSI(14)"]), ("볼린저", ["%B"]), ("VR", ["VR(20)"]), ("OBV", ["OBV"])]
 
+LEGEND = ("범례: ✅ 강세 / ❌ 약세 / ⚠️ 주의(과열·과매도·혼조·구름 안) / ➖ 데이터 없음. 노란 칸(마크다운은 [ ])은 직전 거래일과 달라진 항목. "
+          "추세 = 종가>20·50·200일선, 정배열 · 일목 = 구름 위, 전환>기준, 후행스팬 · MACD = 시그널 위, 0선 위 · "
+          "RSI 50~70 ✅, 30~50 ❌ · 볼린저 %B 0.5~1 ✅ · VR 100~450% ✅ · OBV > 20일 평균 ✅. 연구용 요약이며 매매 권유가 아님.")
 
-def _cell(rep: TickerReport, names: list[str]) -> str:
-    return "".join(rep.check(n).status for n in names)
+
+def _changed_names(rep: TickerReport) -> set[str]:
+    return {now.name for _, now in rep.changes}
 
 
 def _headline(reports: list[TickerReport]) -> list[str]:
@@ -213,28 +266,85 @@ def _headline(reports: list[TickerReport]) -> list[str]:
     return lines
 
 
-def render_markdown(reports: list[TickerReport]) -> str:
+def change_lines(reports: list[TickerReport]) -> tuple[str, list[str]]:
+    """(요약 한 줄, 종목별 변화 줄). ✅ 개수 변화가 큰 순."""
+    rows = [r for r in reports if r.changes]
+    if not any(r.prev_checks for r in reports):
+        return "직전 거래일 비교 불가", []
+    better = [r for r in rows if r.prev_ups is not None and r.ups > r.prev_ups]
+    worse = [r for r in rows if r.prev_ups is not None and r.ups < r.prev_ups]
+    n = sum(len(r.changes) for r in rows)
+    summary = f"변화 {n}건 · 개선 {len(better)}종목 · 악화 {len(worse)}종목"
+    lines = []
+    for r in sorted(rows, key=lambda r: -abs(r.ups - (r.prev_ups or 0))):
+        diff = f"✅ {r.prev_ups}→{r.ups}"
+        items = ", ".join(f"{now.name} {prev.status}→{now.status}" for prev, now in r.changes)
+        lines.append(f"{r.ticker} ({diff}): {items}")
+    return summary, lines
+
+
+def quality_lines(reports: list[TickerReport], failed: list[str]) -> list[str]:
+    lines = [f"{r.ticker}: {i}" for r in reports for i in r.issues]
+    lines += [f"{f} — 불러오기 실패" for f in failed]
+    return lines
+
+
+def _md_cell(rep: TickerReport, names: list[str]) -> str:
+    changed = _changed_names(rep)
+    return "".join(f"[{rep.check(n).status}]" if n in changed else rep.check(n).status for n in names)
+
+
+def make_subject(reports: list[TickerReport], meta: dict) -> str:
+    date = max(r.date for r in reports).date()
+    q = quality_lines(reports, meta.get("failed", []))
+    if meta.get("mode") == "holiday":
+        return f"[휴장] 미장 체크리스트 · {meta['checked']} {meta['holiday']} · 다음 개장 {meta['next_open']}"
+    if meta.get("mode") == "delayed":
+        return f"[데이터 지연] 미장 체크리스트 · 기대 {meta['target']}, 수신 {date}"
+    summary, _ = change_lines(reports)
+    heads = _headline(reports)
+    lead = heads[0] if heads else ""
+    subject = f"[미장 체크리스트] {date} · {summary.split(' · ')[0]} · {lead}"
+    if q:
+        subject = "[점검 필요] " + subject
+    return subject if len(subject) <= 100 else subject[:99] + "…"
+
+
+def render_markdown(reports: list[TickerReport], meta: dict | None = None) -> str:
+    meta = meta or {}
     date = max(r.date for r in reports).date()
     total = len(reports[0].checks)
+    q = quality_lines(reports, meta.get("failed", []))
+    heads = _headline(reports)
+    if meta.get("mode") == "holiday":
+        out = [f"# 미국장 휴장 안내 · {meta['checked']} {meta['holiday']}", "",
+               f"다음 거래일: {meta['next_open']}. 새 종가가 없어 체크리스트는 직전 거래일({date}) 기준이며 변화는 없습니다.", ""]
+        out += ["## 데이터 점검"] + ([f"- ⚠️ {x}" for x in q] or ["- 이상 없음"]) + [""]
+        out += [f"## 직전 거래일({date}) 요약"] + [f"- {h}" for h in heads] + [""]
+        ev = [f"- **{r.ticker}**: {', '.join(r.events)}" for r in reports if r.events]
+        out += ["## 직전 거래일 이벤트"] + (ev or ["- 없음"])
+        return "\n".join(out)
+
     out = [f"# 미국장 지표 체크리스트 ({date} 종가 기준)", ""]
-    out += ["## 한눈에 보기"] + [f"- {h}" for h in _headline(reports)] + [""]
+    if meta.get("mode") == "delayed":
+        out += [f"> ⚠️ 데이터 지연: 기대 기준일 {meta['target']}, 받은 데이터 {date}. 아래는 받은 데이터 기준입니다.", ""]
+    out += ["## 데이터 점검"] + ([f"- ⚠️ {x}" for x in q] or [f"- 이상 없음 ({len(reports)}종목, 기준일 {date})"]) + [""]
+    out += ["## 한눈에 보기"] + [f"- {h}" for h in heads] + [""]
+    summary, lines = change_lines(reports)
+    out += [f"## 전일 대비 변화 — {summary}"] + ([f"- {x}" for x in lines] or ["- 없음"]) + [""]
     out.append("## 체크리스트")
     header = ["종목", "종가", "등락", "고점대비"] + [g for g, _ in COLUMNS] + ["✅/❌"]
     out.append("| " + " | ".join(header) + " |")
     out.append("|" + "---|" * len(header))
     for r in reports:
-        row = [f"{r.ticker}", f"{r.close:,.2f}", f"{r.change:+.1%}", f"{r.from_high:+.1%}"]
-        row += [_cell(r, names) for _, names in COLUMNS]
-        row.append(f"{r.ups}/{r.downs} (총 {total})")
+        row = [f"{r.ticker}" + (" ⚠️" if r.issues else ""), f"{r.close:,.2f}", f"{r.change:+.1%}", f"{r.from_high:+.1%}"]
+        row += [_md_cell(r, names) for _, names in COLUMNS]
+        prev = f" (전일 {r.prev_ups})" if r.prev_ups is not None and r.prev_ups != r.ups else ""
+        row.append(f"{r.ups}/{r.downs}{prev} (총 {total})")
         out.append("| " + " | ".join(row) + " |")
     out += ["", "## 오늘의 이벤트"]
-    any_ev = False
-    for r in reports:
-        if r.events:
-            any_ev = True
-            out.append(f"- **{r.ticker}**: {', '.join(r.events)}")
-    if not any_ev:
-        out.append("- 없음")
+    ev = [f"- **{r.ticker}**: {', '.join(r.events)}" for r in reports if r.events]
+    out += ev or ["- 없음"]
     out += ["", "## 상세"]
     for r in reports:
         out.append(f"- **{r.ticker}** {r.name}: " + " · ".join(f"{c.name} {c.status} {c.detail}" for c in r.checks))
@@ -242,27 +352,92 @@ def render_markdown(reports: list[TickerReport]) -> str:
     return "\n".join(out)
 
 
-LEGEND = ("범례: ✅ 강세 / ❌ 약세 / ⚠️ 주의(과열·과매도·혼조·구름 안) / ➖ 데이터 없음. "
-          "추세 = 종가>20·50·200일선, 정배열 · 일목 = 구름 위, 전환>기준, 후행스팬 · MACD = 시그널 위, 0선 위 · "
-          "RSI 50~70 ✅, 30~50 ❌ · 볼린저 %B 0.5~1 ✅ · VR 100~450% ✅ · OBV > 20일 평균 ✅. 연구용 요약이며 매매 권유가 아님.")
+def render_text(reports: list[TickerReport], meta: dict | None = None) -> str:
+    """메일 일반 텍스트 본문 (마크다운 기호 없음)."""
+    meta = meta or {}
+    date = max(r.date for r in reports).date()
+    q = quality_lines(reports, meta.get("failed", []))
+    lines = []
+    if meta.get("mode") == "holiday":
+        lines += [f"미국장 휴장 안내: {meta['checked']} {meta['holiday']}", f"다음 거래일: {meta['next_open']}",
+                  f"아래는 직전 거래일({date}) 요약입니다.", ""]
+    else:
+        lines += [f"미국장 지표 체크리스트 ({date} 종가 기준)", ""]
+        if meta.get("mode") == "delayed":
+            lines += [f"주의: 데이터 지연 (기대 {meta['target']}, 받은 데이터 {date})", ""]
+    lines += ["데이터 점검"] + ([f"- {x}" for x in q] or ["- 이상 없음"]) + [""]
+    lines += ["한눈에 보기"] + [f"- {h}" for h in _headline(reports)] + [""]
+    if meta.get("mode") != "holiday":
+        summary, cl = change_lines(reports)
+        lines += [f"전일 대비 변화: {summary}"] + [f"- {x}" for x in cl] + [""]
+    ev = [f"- {r.ticker}: {', '.join(r.events)}" for r in reports if r.events]
+    lines += ["이벤트"] + (ev or ["- 없음"]) + ["", "표와 상세는 HTML 메일에서 볼 수 있습니다. 연구용 요약이며 매매 권유가 아닙니다."]
+    return "\n".join(lines)
 
 
-def render_html(reports: list[TickerReport]) -> str:
+_CSS = ("<style>.ck{font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222}"
+        ".ck table{border-collapse:collapse}.ck th{padding:6px 8px;background:#f2f2f2;border-bottom:2px solid #999;"
+        "white-space:nowrap}.ck td{padding:4px 8px;border-bottom:1px solid #ddd;white-space:nowrap}"
+        ".ck td.c{text-align:center}.ck td.l{text-align:left}.ck td.d{white-space:normal;font-size:13px}"
+        ".ck .g{font-weight:bold;color:#555;padding-top:8px}.ck .m{color:#777}"
+        ".ck .x{background:#ffe58a;border-radius:3px;padding:0 1px}"
+        ".ck .box{border-left:4px solid #999;background:#fafafa;padding:6px 10px;margin:8px 0}"
+        ".ck .warn{border-left-color:#e65100;background:#fff3e0}.ck .ok{border-left-color:#2e7d32;background:#f1f8e9}"
+        ".ck h3{margin:14px 0 4px}.ck ul{margin:0;padding-left:20px}</style>")
+
+
+def _html_cell(rep: TickerReport, names: list[str]) -> str:
+    changed = {now.name: prev.status for prev, now in rep.changes}
+    out = []
+    for n in names:
+        st = rep.check(n).status
+        if n in changed:
+            out.append(f"<span class='x' title='전일 {changed[n]}'>{st}</span>")
+        else:
+            out.append(st)
+    return "".join(out)
+
+
+def _ul(items: list[str], e) -> str:
+    return "<ul>" + "".join(f"<li>{e(x)}</li>" for x in items) + "</ul>"
+
+
+def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
+    meta = meta or {}
+    e = html.escape
     date = max(r.date for r in reports).date()
     total = len(reports[0].checks)
-    e = html.escape
-    td, tdl = 'class="c"', 'class="l"'
-    parts = ["<style>.ck{font-family:-apple-system,Segoe UI,Malgun Gothic,sans-serif;font-size:14px;color:#222}"
-             ".ck table{border-collapse:collapse}.ck th{padding:6px 8px;background:#f2f2f2;border-bottom:2px solid #999;"
-             "white-space:nowrap}.ck td{padding:4px 8px;border-bottom:1px solid #ddd;white-space:nowrap}"
-             ".ck td.c{text-align:center}.ck td.l{text-align:left}.ck td.d{white-space:normal;font-size:13px}"
-             ".ck .g{font-weight:bold;color:#555;padding-top:8px}.ck .m{color:#777}</style>",
-             '<div class="ck">',
-             f"<h2 style='margin:0 0 8px'>미국장 지표 체크리스트 <span class='m' style='font-weight:normal'>({date} 종가)</span></h2>"]
+    q = quality_lines(reports, meta.get("failed", []))
     heads = _headline(reports)
+    qbox = (f"<div class='box warn'><b>데이터 점검 ⚠️</b>{_ul(q, e)}</div>" if q
+            else f"<div class='box ok'><b>데이터 점검</b>: 이상 없음 ({len(reports)}종목, 기준일 {date})</div>")
+    parts = [_CSS, '<div class="ck">']
+
+    if meta.get("mode") == "holiday":
+        parts.append(f"<h2 style='margin:0 0 8px'>🇺🇸 미국장 휴장 · {e(str(meta['checked']))} {e(meta['holiday'])}</h2>")
+        parts.append(f"<p>다음 거래일: <b>{e(str(meta['next_open']))}</b>. 새 종가가 없어 체크리스트는 "
+                     f"직전 거래일({date}) 기준이며 변화는 없습니다.</p>")
+        parts.append(qbox)
+        parts.append(f"<h3>직전 거래일({date}) 요약</h3>" + _ul(heads, e))
+        evs = [r for r in reports if r.events]
+        parts.append("<h3>직전 거래일 이벤트</h3>" + (
+            "<ul>" + "".join(f"<li><b>{e(r.ticker)}</b>: {e(', '.join(r.events))}</li>" for r in evs) + "</ul>"
+            if evs else "<p>없음</p>"))
+        parts.append(f"<p class='m' style='font-size:12px'>{e(LEGEND)}</p></div>")
+        return "".join(parts)
+
+    parts.append(f"<h2 style='margin:0 0 8px'>미국장 지표 체크리스트 <span class='m' style='font-weight:normal'>({date} 종가)</span></h2>")
+    if meta.get("mode") == "delayed":
+        parts.append(f"<div class='box warn'><b>데이터 지연</b>: 기대 기준일 {e(str(meta['target']))}, "
+                     f"받은 데이터 {date}. 아래는 받은 데이터 기준입니다.</div>")
+    parts.append(qbox)
     if heads:
-        parts.append("<ul style='margin:4px 0 12px;padding-left:20px'>" + "".join(f"<li>{e(h)}</li>" for h in heads) + "</ul>")
-    parts.append("<table><tr>")
+        parts.append("<h3>한눈에 보기</h3>" + _ul(heads, e))
+    summary, cl = change_lines(reports)
+    parts.append(f"<h3>전일 대비 변화 <span class='m' style='font-weight:normal'>— {e(summary)}</span></h3>")
+    parts.append(_ul(cl, e) if cl else "<p>없음</p>")
+
+    parts.append("<h3>체크리스트 <span class='m' style='font-weight:normal;font-size:12px'>노란 칸 = 전일과 달라진 항목</span></h3><table><tr>")
     for h in ["종목", "종가", "등락", "고점대비"] + [g for g, _ in COLUMNS] + ["✅/❌"]:
         parts.append(f"<th>{e(h)}</th>")
     parts.append("</tr>")
@@ -273,25 +448,26 @@ def render_html(reports: list[TickerReport]) -> str:
             group = r.group
             parts.append(f"<tr><td colspan='{ncol}' class='g'>{e(group)}</td></tr>")
         color = "#c62828" if r.change > 0 else "#1565c0" if r.change < 0 else "#222"
-        parts.append("<tr>")
-        parts.append(f"<td {tdl}><b>{e(r.ticker)}</b> <span class='m'>{e(r.name)}</span></td>")
-        parts.append(f"<td {td}>{r.close:,.2f}</td><td {td}><span style='color:{color}'>{r.change:+.1%}</span></td>")
-        parts.append(f"<td {td}>{r.from_high:+.1%}</td>")
+        flag = " ⚠️" if r.issues else ""
+        parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b>{flag} <span class='m'>{e(r.name)}</span></td>")
+        parts.append(f"<td class='c'>{r.close:,.2f}</td><td class='c'><span style='color:{color}'>{r.change:+.1%}</span></td>")
+        parts.append(f"<td class='c'>{r.from_high:+.1%}</td>")
         for _, names in COLUMNS:
-            parts.append(f"<td {td}>{_cell(r, names)}</td>")
-        parts.append(f"<td {td}>{r.ups}/{r.downs} <span class='m'>({total})</span></td></tr>")
+            parts.append(f"<td class='c'>{_html_cell(r, names)}</td>")
+        delta = ""
+        if r.prev_ups is not None and r.prev_ups != r.ups:
+            arrow = "▲" if r.ups > r.prev_ups else "▼"
+            delta = f" <span class='x'>{arrow}{abs(r.ups - r.prev_ups)}</span>"
+        parts.append(f"<td class='c'>{r.ups}/{r.downs}{delta} <span class='m'>({total})</span></td></tr>")
     parts.append("</table>")
-    parts.append("<h3 style='margin:16px 0 4px'>오늘의 이벤트</h3>")
+
     evs = [r for r in reports if r.events]
-    if evs:
-        parts.append("<ul style='margin:0;padding-left:20px'>" +
-                     "".join(f"<li><b>{e(r.ticker)}</b>: {e(', '.join(r.events))}</li>" for r in evs) + "</ul>")
-    else:
-        parts.append("<p style='margin:0'>없음</p>")
-    parts.append("<h3 style='margin:16px 0 4px'>상세</h3><table>")
+    parts.append("<h3>오늘의 이벤트</h3>" + (
+        "<ul>" + "".join(f"<li><b>{e(r.ticker)}</b>: {e(', '.join(r.events))}</li>" for r in evs) + "</ul>"
+        if evs else "<p>없음</p>"))
+    parts.append("<h3>상세</h3><table>")
     for r in reports:
         detail = " · ".join(f"{c.name} {c.status} {c.detail}" for c in r.checks)
-        parts.append(f"<tr><td {tdl}><b>{e(r.ticker)}</b></td><td class='d'>{e(detail)}</td></tr>")
-    parts.append("</table>")
-    parts.append(f"<p style='color:#777;font-size:12px;margin-top:16px'>{e(LEGEND)}</p></div>")
+        parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b></td><td class='d'>{e(detail)}</td></tr>")
+    parts.append(f"</table><p class='m' style='font-size:12px;margin-top:16px'>{e(LEGEND)}</p></div>")
     return "".join(parts)

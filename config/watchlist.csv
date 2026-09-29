@@ -2,14 +2,23 @@ group,ticker,name,bench
 지수,SPY,S&P 500,
 지수,QQQ,나스닥100,SPY
 지수,IWM,러셀2000,SPY
+지수,VTV,미국 가치주,SPY
 해외 증시,EWY,한국,SPY
 해외 증시,EWJ,일본,SPY
 해외 증시,MCHI,중국,SPY
-자산배분,VWO,신흥국,SPY
-자산배분,GLD,금,
-자산배분,PDBC,원자재,
-자산배분,EDV,초장기국채,
-자산배분,UUP,달러,
+해외 증시,INDA,인도,SPY
+해외 증시,VWO,신흥국,SPY
+원자재·통화,GLD,금,
+원자재·통화,SLV,은,
+원자재·통화,PDBC,원자재,
+원자재·통화,CPER,구리,
+원자재·통화,UUP,달러,
+채권·부동산,EDV,초장기국채,
+채권·부동산,TIP,물가연동국채,
+채권·부동산,HYG,하이일드 회사채,
+채권·부동산,VNQ,미국 리츠,SPY
+대체,IBIT,비트코인,QQQ
+대체,DBMF,매니지드 퓨처스,
 빅테크,AAPL,애플,SPY
 빅테크,MSFT,마이크로소프트,SPY
 빅테크,NVDA,엔비디아,SPY

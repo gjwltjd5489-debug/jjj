@@ -368,7 +368,7 @@ def trade_signal(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None) -
             "event": last["event"], "blocked": last["blocked"], "stop": float(last["stop"]),
             "close": float(last["close"]), "above200": bool(last["above200"]), "ma200": float(last["ma200"]),
             "overheat": bool(last["overheat"]), "highvol": bool(last["highvol"]), "recent": recent,
-            "hist": o[["score_s", "state", "close"]].iloc[-70:].copy()}  # 바구니 계산용 (지난 교체일들)
+            "hist": o[["score_s", "state", "close"]].iloc[-300:].copy()}  # 바구니 계산용 (지난 교체일들, 약 1년)
 
 
 def _entry_risks(g: dict) -> list[str]:
@@ -484,6 +484,29 @@ def _ret(c1: dict, c0: dict, t: str) -> float:
     return c1[t] / c0[t] - 1 if t in c1 and t in c0 and c0[t] else float("nan")
 
 
+def _entry_dates(reports: list[TickerReport], members, start) -> dict:
+    """start 교체일 바구니의 종목들이 끊기지 않고 들어 있던 가장 이른 교체일 (편입일).
+
+    반환: 종목 → (편입일, 데이터가 모자라 더 거슬러 가지 못했는지)."""
+    first = min((r.sig["hist"].index[0].date() for r in reports if r.sig and r.sig.get("hist") is not None
+                 and not r.sig["hist"].empty), default=start)
+    entry = {t: (start, False) for t in members}
+    track, d = set(members), start
+    while track:
+        d = prev_rebalance(d)
+        if d < first:
+            entry.update({t: (entry[t][0], True) for t in track})
+            break
+        sc, hd = _state_at(reports, d)
+        w = basket_weights(sc, hd)
+        for t in list(track):
+            if t in w:
+                entry[t] = (d, False)
+            else:
+                track.discard(t)
+    return entry
+
+
 def basket_state(reports: list[TickerReport]) -> dict | None:
     """현재 바구니와 직전 바구니 대비 변화. 오늘 종가가 교체일(15일·월말)이면 '오늘 교체'."""
     if not any(r.sig and r.sig.get("hist") is not None for r in reports):
@@ -505,11 +528,22 @@ def basket_state(reports: list[TickerReport]) -> dict | None:
         out.append((t, why))
     # 수익률: 평소에는 이번 기간(지난 교체일 종가 → 오늘), 교체일에는 방금 끝난 기간(지난 바구니 기준)
     c_now, c_base, c_prev = _close_at(reports), _close_at(reports, base), _close_at(reports, prev)
+    # 편입 후 수익률: 바구니에 처음 들어온 교체일 종가 → 오늘 종가 (끊기지 않고 들어 있던 기간)
+    ent = _entry_dates(reports, set(w), base)
+    ent0 = _entry_dates(reports, set(w0) - set(w), prev)
+    c_ent = {t: _close_at(reports, d).get(t) for t, (d, _) in {**ent, **ent0}.items()}
+
+    def since(t: str, e: dict) -> dict:
+        d, cut = e[t]
+        c0 = c_ent.get(t)
+        return {"since": d, "since_cut": cut,
+                "ret_hold": c_now[t] / c0 - 1 if c0 and t in c_now else float("nan")}
     rows = [{"ticker": t, "weight": w[t], "score": sc[t], "now": now.get(t, {}).get("score_s", float("nan")),
              "new": t not in w0, "held_now": bool(now.get(t, {}).get("held", True)),
-             "ret": (_ret(c_now, c_prev, t) if t in w0 else float("nan")) if rebalance else _ret(c_now, c_base, t)}
+             "ret": (_ret(c_now, c_prev, t) if t in w0 else float("nan")) if rebalance else _ret(c_now, c_base, t),
+             **since(t, ent)}
             for t in sorted(w, key=lambda x: (-sc[x], x))]
-    out = [(t, why, _ret(c_now, c_prev, t)) for t, why in out]
+    out = [(t, why, since(t, ent0)) for t, why in out]
     if rebalance:  # 방금 끝난 달의 지난 바구니 성과 (현금 포함)
         rets = {t: _ret(c_now, c_prev, t) for t in w0}
         month_ret = sum(w0[t] * rets[t] for t in w0 if pd.notna(rets[t]))
@@ -523,6 +557,10 @@ def basket_state(reports: list[TickerReport]) -> dict | None:
 
 def _md(d) -> str:
     return f"{d.month}/{d.day}"
+
+
+def _since_text(x: dict) -> str:
+    return f"{'~' if x['since_cut'] else ''}{_md(x['since'])}~"
 
 
 def _ret_label(b: dict) -> str:
@@ -547,11 +585,14 @@ def _basket_lines(b: dict) -> list[str]:
     for x in b["rows"]:
         tag = " (신규)" if x["new"] and b["rebalance"] else ""
         warn = " · ⚠️ 교체 사이 규칙 매도 신호 (다음 교체일까지 보유)" if not b["rebalance"] and not x["held_now"] else ""
-        ret = "" if pd.isna(x["ret"]) else (f" · 지난 기간 {x['ret']:+.1%}" if b["rebalance"] else f" · 이번 기간 {x['ret']:+.1%}")
+        new_today = x["new"] and b["rebalance"]
+        ret = "" if new_today or pd.isna(x["ret_hold"]) else f" · 편입 후 {x['ret_hold']:+.1%} ({_since_text(x)})"
         lines.append(f"{x['ticker']} {x['weight'] * 100:.1f}% · 점수 {x['score']:.0f}"
                      + ("" if b["rebalance"] else f" → 오늘 {x['now']:.0f}") + ret + tag + warn)
     if b["rebalance"]:
-        lines += [f"제외 {t}: {why}" + ("" if pd.isna(r) else f" · 지난 기간 {r:+.1%}") for t, why, r in b["out"]]
+        lines += [f"제외 {t}: {why}" + ("" if pd.isna(h["ret_hold"]) else
+                                       f" · 보유 기간 {h['ret_hold']:+.1%} ({_since_text(h)}{_md(b['base'])})")
+                  for t, why, h in b["out"]]
     lines.append(f"현금 {b['cash'] * 100:.0f}%")
     lines.append(f"{_ret_label(b)}: {b['month_ret']:+.1%} (배당 포함, 현금 수익 0으로 계산)")
     return lines
@@ -570,13 +611,13 @@ def _basket_html(b: dict) -> str:
     parts.append(f"<p style='margin:2px 0 4px;font-size:13px'>{e(_ret_label(b))}: <b>{_pct_html(b['month_ret'])}</b></p>")
     parts.append("<table class='tb'><tr><th class='s'>종목</th><th class='s'>비중</th>"
                  f"<th class='s'>점수<br>{_md(b['base'])}</th>" + ("" if b["rebalance"] else "<th class='s'>점수<br>오늘</th>")
-                 + "<th class='s'>비고<br>" + ("지난 기간 수익률" if b["rebalance"] else "이번 기간 수익률") + "</th></tr>")
+                 + "<th class='s'>비고<br>편입 후 수익률</th></tr>")
     for x in b["rows"]:
-        if b["rebalance"]:
-            note = "🆕 신규" if x["new"] else f"지난 기간 {_pct_html(x['ret'])}"
+        if b["rebalance"] and x["new"]:
+            note = "🆕 신규"
         else:
-            note = f"<b>{_pct_html(x['ret'])}</b>"
-            if not x["held_now"]:
+            note = f"<b>{_pct_html(x['ret_hold'])}</b><br><span class='s10'>{_since_text(x)}</span>"
+            if not b["rebalance"] and not x["held_now"]:
                 note += "<br><span class='wr'>⚠️ 규칙 매도 신호<br>다음 교체일까지 보유</span>"
         parts.append(f"<tr><td class='l' style='font-size:13px'><b>{e(x['ticker'])}</b><br><span class='m nm'>"
                      f"{e(b['name'].get(x['ticker'], ''))}</span></td><td class='c'><b>{x['weight'] * 100:.1f}%</b></td>"
@@ -584,10 +625,11 @@ def _basket_html(b: dict) -> str:
                      + ("" if b["rebalance"] else f"<td class='c'>{_sc_badge(x['now'])}</td>")
                      + f"<td class='c' style='font-size:12px'>{note}</td></tr>")
     if b["rebalance"]:
-        for t, why, r in b["out"]:
+        for t, why, h in b["out"]:
             parts.append(f"<tr><td class='l' style='font-size:13px;color:#999'><s>{e(t)}</s></td><td class='c m'>0%</td>"
                          f"<td class='c m' colspan='2' style='font-size:12px'>제외 · {e(why)}"
-                         + ("" if pd.isna(r) else f"<br>지난 기간 {_pct_html(r)}") + "</td></tr>")
+                         + ("" if pd.isna(h["ret_hold"]) else
+                            f"<br>보유 기간 {_pct_html(h['ret_hold'])} ({_since_text(h)}{_md(b['base'])})") + "</td></tr>")
     parts.append(f"<tr><td class='l m' style='font-size:13px'>현금</td><td class='c'><b>{b['cash'] * 100:.0f}%</b></td>"
                  f"<td colspan='{2 if b['rebalance'] else 3}'></td></tr></table>")
     return "".join(parts)

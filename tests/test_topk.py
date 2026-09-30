@@ -78,6 +78,9 @@ def test_basket_state_between_and_on_rebalance_day():
     # 이번 기간 수익률: T04 +10%, 나머지 0% → 바구니 +2% (20%씩)
     assert abs(next(x for x in mid["rows"] if x["ticker"] == "T04")["ret"] - 0.10) < 1e-12
     assert abs(mid["month_ret"] - 0.02) < 1e-12
+    # 편입 후 수익률: T04 는 8/14·8/31·9/15 바구니에 계속 있었다 → 데이터 첫 교체일(8/14)부터, 더 이전은 데이터 없음 표시
+    t04 = next(x for x in mid["rows"] if x["ticker"] == "T04")
+    assert t04["since"] == date(2026, 8, 14) and t04["since_cut"] and abs(t04["ret_hold"] - 0.10) < 1e-12
     reb = basket_state(_reports("2026-09-30"))               # 9/30: 월말 → 교체
     assert reb["rebalance"] and reb["base"] == date(2026, 9, 30) and reb["prev"] == date(2026, 9, 15)
     assert reb["next"] == date(2026, 10, 15)
@@ -91,3 +94,9 @@ def test_basket_state_between_and_on_rebalance_day():
     assert "🧺 바구니" in render_html(reps, meta) and "제외 T03: 규칙상 매도" in render_text(reps, meta)
     assert abs(reb["month_ret"] - 0.02) < 1e-12 and "지난 바구니 수익률 (9/15 → 9/30 종가): +2.0%" in render_text(reps, meta)
     assert "이번 기간 수익률 (9/15 종가 → 9/29 종가): +2.0%" in render_text(_reports("2026-09-29"), meta)
+    assert "T04 20.0% · 점수 83 → 오늘 86 · 편입 후 +10.0% (~8/14~)" in render_text(_reports("2026-09-29"), meta)
+    # 교체일: 유지 종목은 편입 후, 제외 종목은 보유 기간 수익률, 신규는 표시만
+    t04r = next(x for x in reb["rows"] if x["ticker"] == "T04")
+    assert t04r["since"] == date(2026, 8, 14)
+    text = render_text(reps, meta)
+    assert "제외 T00: 점수 50 < 60 · 보유 기간 +0.0% (~8/14~9/30)" in text and "T05 20.0% · 점수 99 (신규)" in text

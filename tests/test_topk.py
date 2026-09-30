@@ -52,8 +52,9 @@ def _reports(last: str):
         held_sep = i != 3                            # T03 은 9월에 규칙 매도
         if i in (10, 11):
             s_sep = 99
+        close = np.where(idx <= "2026-08-31", 100.0, 110.0 if i == 4 else 100.0)  # T04 는 9월에 +10%
         hist = pd.DataFrame({"score_s": np.where(aug, s_aug, s_sep).astype(float),
-                             "state": np.where(aug, 1.0, float(held_sep))}, index=idx)
+                             "state": np.where(aug, 1.0, float(held_sep)), "close": close}, index=idx)
         sig = {"score": s_sep, "score_s": s_sep, "prev_score_s": s_sep, "proj": s_sep, "held": held_sep, "event": "",
                "blocked": "", "stop": 95.0, "close": 100.0, "above200": True, "ma200": 90.0, "overheat": False,
                "highvol": False, "recent": [], "hist": hist}
@@ -68,13 +69,18 @@ def test_basket_state_mid_month_and_rebalance_day():
     assert not mid["rebalance"] and mid["base"] == date(2026, 8, 31) and mid["next"] == date(2026, 9, 30)
     assert [x["ticker"] for x in mid["rows"]] == [f"T{i:02d}" for i in range(10)]
     assert not next(x for x in mid["rows"] if x["ticker"] == "T03")["held_now"]  # 달 중간 매도 신호 표시
+    # 이번 달 수익률: T04 +10%, 나머지 0% → 바구니 +1% (10%씩)
+    assert abs(next(x for x in mid["rows"] if x["ticker"] == "T04")["ret"] - 0.10) < 1e-12
+    assert abs(mid["month_ret"] - 0.01) < 1e-12
     reb = basket_state(_reports("2026-09-30"))               # 9/30: 월말 → 교체
     assert reb["rebalance"] and reb["base"] == date(2026, 9, 30) and reb["next"] == date(2026, 10, 30)
     names = [x["ticker"] for x in reb["rows"]]
     assert {"T10", "T11"} <= set(names) and not {"T00", "T01", "T03"} & set(names)
-    out = dict(reb["out"])
+    out = {t: why for t, why, _ in reb["out"]}
     assert out["T00"].startswith("점수 50") and out["T03"] == "규칙상 매도"
     meta = {"mode": "normal", "failed": []}
     reps = _reports("2026-09-30")
     assert "바구니 교체 +" in make_subject(reps, meta)
     assert "이번 달 바구니" in render_html(reps, meta) and "제외 T03: 규칙상 매도" in render_text(reps, meta)
+    assert abs(reb["month_ret"] - 0.01) < 1e-12 and "지난달 바구니 수익률" in render_text(reps, meta)
+    assert "이번 달 수익률 (8/31 종가 → 9/29 종가): +1.0%" in render_text(_reports("2026-09-29"), meta)

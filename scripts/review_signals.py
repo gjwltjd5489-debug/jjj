@@ -132,7 +132,7 @@ def main() -> None:
 
     tk, ev, years, blocks, vrows = [], [], [], [], []
     port: dict[str, list[pd.Series]] = {v: [] for v in VARIANTS} | {"보유": []}
-    fam, wrows, quality = [], [], {w: [] for w in WEIGHT_SETS}
+    fam, wrows, quality, halves = [], [], {w: [] for w in WEIGHT_SETS}, []
     wport: dict[str, list[pd.Series]] = {}
     for row in wl.itertuples(index=False):
         t = row.ticker
@@ -224,9 +224,11 @@ def main() -> None:
             cross = ((sc >= RULE.entry) != (sc.shift(1) >= RULE.entry)) & sc.notna() & sc.shift(1).notna()
             quality[wn].append(pd.DataFrame({"t": t, "s": sc, "fmin": fmin, "fvol": fvol, "f60": f60,
                                              "cross": cross.astype(float)}))
-            for rn, kw in (("이전 퇴출", {}), ("A", dict(exit_above=None))):
-                st = run_variant(ow, x["ma_mid"], a14, **kw)
-                rr = state_returns(c, st)
+            sts = {"이전 퇴출": run_variant(ow, x["ma_mid"], a14), "A": run_variant(ow, x["ma_mid"], a14, exit_above=None)}
+            sts["반반"] = (sts["이전 퇴출"] + sts["A"]) / 2  # 40 이하에 절반, 200일선 이탈에 나머지
+            for rn, st in sts.items():
+                rr = state_returns(c, sts["이전 퇴출"]) / 2 + state_returns(c, sts["A"]) / 2 if rn == "반반" \
+                    else state_returns(c, st)
                 wport.setdefault(f"{wn} + {rn}", []).append(rr.rename(t))
                 for pn, a, b in periods:
                     seg = rr.loc[a:b]
@@ -235,6 +237,17 @@ def main() -> None:
                     ps, pos = perf_stats(seg), st.loc[a:b].fillna(0.0)
                     wrows.append({"w": wn, "r": rn, "t": t, "p": pn, "sharpe": ps["sharpe"],
                                   "tpy": (pos.diff() > 0).sum() / (len(seg) / 252)})
+            if w is WEIGHTS:  # 반반의 '절반 매도'(200일선 위에서 40 이하) 이후 결과
+                gap = sts["A"].fillna(0.0) - sts["이전 퇴출"].fillna(0.0)
+                for d in gap.index[(gap > 0) & (gap.shift(1).fillna(0.0) <= 0)]:
+                    k = c.index.get_loc(d)
+                    rest = gap.iloc[k:]
+                    done = bool((rest <= 0).any())
+                    until = rest.index[(rest <= 0).argmax()] if done else rest.index[-1]
+                    how = ("진행 중" if not done else "200일선 이탈 → 나머지도 매도" if sts["A"].loc[until] == 0
+                           else "점수 회복 → 절반 되사기")
+                    halves.append({"last": d >= A, "how": how, "ret": c.loc[until] / c.iloc[k] - 1,
+                                   "days": c.index.get_loc(until) - k})
         print(f"{t} 완료", file=sys.stderr)
 
     lines: list[str] = []
@@ -382,6 +395,17 @@ def main() -> None:
             rec[name] = pct(mdd(r.loc[a:b]))
         rows.append(rec)
     table(pd.DataFrame(rows))
+    H = pd.DataFrame(halves)
+    if not H.empty:
+        out("### 반반 (W4 배점): 200일선 위에서 40 이하로 절반 매도한 뒤\n")
+        rows = []
+        for lst in (False, True):
+            for how, d in H[H["last"] == lst].groupby("how"):
+                rows.append({"기간": "최근 1년" if lst else "과거", "결말": how, "건수": len(d),
+                             "절반 매도 → 결말까지 가격 변화 평균": pct(d.ret.mean()), "중앙값": pct(d.ret.median()),
+                             "걸린 거래일": f"{d.days.median():.0f}"})
+        table(pd.DataFrame(rows))
+        out("가격 변화가 +면 판 절반을 더 비싸게 되산 것(손해), −면 판 절반이 그만큼 하락을 피한 것(이익).\n")
     out("### 점수 자체의 품질 (3일 평균, 매매 규칙과 무관)\n")
     rows = []
     for wn, lst in quality.items():

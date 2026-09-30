@@ -15,6 +15,7 @@ QQQ 기준으로 시작했고, 종목별 프로파일로 확장할 수 있다. *
 | [docs/checklist_score.md](docs/checklist_score.md) | 체크리스트 점수(성향 색으로 계산)와 매수·매도 규칙, 27종목 검증 |
 | [docs/mails.md](docs/mails.md) | 아침 체크리스트·장초반 확인 메일 구성, 일정 파일 관리 |
 | [docs/signal_review.md](docs/signal_review.md) | 최근 1년 매수·매도 신호 사후 점검, 원인 분석, 보완 규칙 20년 검증 |
+| [docs/topk.md](docs/topk.md) | 점수 상위 k개 동일가중 보유 전략 (n·k·리밸런싱 주기, 무작위 선택과 비교) |
 
 ## 설치
 ```bash

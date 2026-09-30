@@ -7,6 +7,7 @@
 5. 최근 1년 재진입이 막힌 날(과열·고변동·200일선 아래)과 그동안의 가격 변화
 6. 보완 규칙 후보를 2006~2017 / 2018~점검 전 / 최근 1년으로 나눠 검증 (최근 1년에만 맞춘 규칙은 과최적화)
 7. 배점: 성향별 정보량(2006~2017), 배점 후보 × 퇴출 방식, 점수 자체의 위험 구분력과 안정성
+8. 보유 종목 매도 기준: 현재 배점에서 더 일찍 파는 규칙들(퇴출선 50·60, 보유 중 최고 점수 대비, 가격 손절)
 
 1~6장은 점검 기간에 실제로 쓰던 이전 규칙(동일 배점, 어디서나 40 퇴출)으로 계산한다.
 
@@ -61,6 +62,21 @@ VARIANTS = {
     "D 퇴출에 50일선 이탈 확인": dict(need_below_ma50=True),
     "E 추적 손절(고점 − 3ATR) 추가": dict(trail=3.0),
 }
+# 8장: 현재 배점(W4)에서 보유 종목 매도 기준 후보
+EXITS = {
+    "현재 (200일선 아래 + 40)": dict(exit_above=None),
+    "200일선 아래 + 50": dict(exit_above=None, exit_below=50.0),
+    "200일선 아래 + 60": dict(exit_above=None, exit_below=60.0),
+    "200일선 아래면 점수 무관": dict(exit_above=None, exit_below=101.0),
+    "어디서나 50": dict(exit_above=50.0, exit_below=50.0),
+    "어디서나 60": dict(exit_above=60.0, exit_below=60.0),
+    "현재 + 보유 중 최고 점수 −30": dict(exit_above=None, trail_score=30.0),
+    "현재 + 보유 중 최고 점수 −40": dict(exit_above=None, trail_score=40.0),
+    "현재 + 매수 때 점수 −30": dict(exit_above=None, from_entry=30.0),
+    "현재 + 매수가 −2ATR 손절": dict(exit_above=None, stop_entry_atr=2.0),
+    "현재 + 보유 중 고점 대비 −10%": dict(exit_above=None, trail_pct=0.10),
+    "현재 + 보유 중 고점 대비 −15%": dict(exit_above=None, trail_pct=0.15),
+}
 CRISES = {"2008 금융위기": ("2007-10-01", "2009-03-31"), "2011 유럽위기": ("2011-04-01", "2011-12-31"),
           "2015-16 조정": ("2015-05-01", "2016-03-01"), "2018 4분기": ("2018-09-01", "2018-12-31"),
           "2020 코로나": ("2020-02-01", "2020-04-30"), "2022 긴축": ("2022-01-01", "2022-10-31"),
@@ -69,13 +85,20 @@ CRISES = {"2008 금융위기": ("2007-10-01", "2009-03-31"), "2011 유럽위기"
 
 def run_variant(o: pd.DataFrame, ma50: pd.Series, a14: pd.Series, *, exit_above=OLD.exit, exit_below=OLD.exit,
                 block_hv=RULE.block_highvol, block_oh=RULE.block_overheat, trail=None,
-                need_below_ma50=False) -> pd.Series:
-    """checklist_score 의 run_rule 을 넓힌 상태 기계 (보유 1 / 대기 0)."""
+                need_below_ma50=False, trail_score=None, from_entry=None, stop_entry_atr=None,
+                trail_pct=None) -> pd.Series:
+    """checklist_score 의 run_rule 을 넓힌 상태 기계 (보유 1 / 대기 0).
+
+    trail: 보유 중 최고 종가 − trail×ATR 아래면 매도 · trail_pct: 최고 종가 대비 이 비율 넘게 빠지면 매도
+    trail_score: 보유 중 최고 3일 평균 점수보다 이만큼 낮아지면 매도 · from_entry: 매수 때 점수보다 이만큼 낮아지면 매도
+    stop_entry_atr: 매수가 − 이 배수×ATR(매수일) 아래면 매도
+    """
     s, ab = o["score_s"].to_numpy(), o["above200"].to_numpy()
     oh, hv, c = o["overheat"].to_numpy(), o["highvol"].to_numpy(), o["close"].to_numpy()
     m50, at = ma50.to_numpy(), a14.to_numpy()
     st = np.full(len(s), np.nan)
     cur, started, peak = 0.0, False, np.nan
+    peak_s = entry_s = stop = np.nan
     for k in range(len(s)):
         if np.isnan(s[k]):
             if started:
@@ -84,12 +107,21 @@ def run_variant(o: pd.DataFrame, ma50: pd.Series, a14: pd.Series, *, exit_above=
         started = True
         if cur == 0:
             if s[k] >= RULE.entry and ab[k] and not (block_oh and oh[k]) and not (block_hv and hv[k]):
-                cur, peak = 1.0, c[k]
+                cur, peak, peak_s, entry_s = 1.0, c[k], s[k], s[k]
+                stop = c[k] - stop_entry_atr * at[k] if stop_entry_atr is not None else np.nan
         else:
-            peak = max(peak, c[k])
+            peak, peak_s = max(peak, c[k]), max(peak_s, s[k])
             thr = exit_above if ab[k] else exit_below
             out = thr is not None and s[k] <= thr and (not need_below_ma50 or c[k] < m50[k])
             if trail is not None and not np.isnan(at[k]) and c[k] < peak - trail * at[k]:
+                out = True
+            if trail_pct is not None and c[k] < peak * (1 - trail_pct):
+                out = True
+            if trail_score is not None and s[k] <= peak_s - trail_score:
+                out = True
+            if from_entry is not None and s[k] <= entry_s - from_entry:
+                out = True
+            if stop_entry_atr is not None and c[k] < stop:
                 out = True
             if out:
                 cur = 0.0
@@ -133,6 +165,8 @@ def main() -> None:
     tk, ev, years, blocks, vrows = [], [], [], [], []
     port: dict[str, list[pd.Series]] = {v: [] for v in VARIANTS} | {"보유": []}
     fam, wrows, quality, halves = [], [], {w: [] for w in WEIGHT_SETS}, []
+    xport: dict[str, list[pd.Series]] = {k: [] for k in EXITS}
+    xrows, xtrades = [], []
     wport: dict[str, list[pd.Series]] = {}
     for row in wl.itertuples(index=False):
         t = row.ticker
@@ -248,6 +282,30 @@ def main() -> None:
                            else "점수 회복 → 절반 되사기")
                     halves.append({"last": d >= A, "how": how, "ret": c.loc[until] / c.iloc[k] - 1,
                                    "days": c.index.get_loc(until) - k})
+        # 8. 보유 종목 매도 기준 (현재 배점)
+        on = checklist_score(df, p, bench).loc[first:]
+        for xn, kw in EXITS.items():
+            st = run_variant(on, x["ma_mid"], a14, **kw)
+            rr = state_returns(c, st)
+            xport[xn].append(rr.rename(t))
+            for pn, a, b in periods:
+                seg = rr.loc[a:b]
+                if len(seg) < 200:
+                    continue
+                ps, pos = perf_stats(seg), st.loc[a:b].fillna(0.0)
+                xrows.append({"v": xn, "t": t, "p": pn, "sharpe": ps["sharpe"],
+                              "tpy": (pos.diff() > 0).sum() / (len(seg) / 252)})
+            chg = st.diff()
+            buys, sells = list(st.index[chg == 1]), list(st.index[chg == -1])
+            for bd in buys:
+                sd = next((z for z in sells if z > bd), None)
+                if sd is None or bd >= A:
+                    continue
+                seg = c.loc[bd:sd]
+                nb = next((z for z in buys if z > sd), None)
+                xtrades.append({"v": xn, "entry_s": on["score_s"].loc[bd], "exit_s": on["score_s"].loc[sd],
+                                "ret": c[sd] / c[bd] - 1, "from_peak": c[sd] / seg.max() - 1, "days": len(seg) - 1,
+                                "rebuy": (c[nb] / c[sd] - 1) if nb is not None else np.nan})
         print(f"{t} 완료", file=sys.stderr)
 
     lines: list[str] = []
@@ -418,6 +476,44 @@ def main() -> None:
             rows.append({"배점": wn, "기간": pn, "이후 변동성 ≥70 / ≤40": f"{pct(hi.fvol.mean())} / {pct(lo.fvol.mean())}",
                          "이후 60일 최저 ≥70 / ≤40": f"{pct(hi.fmin.mean())} / {pct(lo.fmin.mean())}",
                          "점수-하락 순위상관": f"{ic:.3f}", "70선 교차/년": f"{q.groupby('t').cross.sum().median() / yrs:.1f}"})
+    table(pd.DataFrame(rows))
+
+    out("## 8. 보유 종목 매도 기준 (현재 배점)\n")
+    out("### 동일가중 포트폴리오 (수익 · 최대낙폭 · 샤프) / 종목 중앙값 샤프, 샤프가 현재보다 높은 종목\n")
+    X = pd.DataFrame(xrows)
+    xb = X[X.v == "현재 (200일선 아래 + 40)"].set_index(["t", "p"])
+    rows = []
+    for xn, lst in xport.items():
+        r = pd.concat(lst, axis=1).mean(axis=1, skipna=True)
+        j = X[X.v == xn].set_index(["t", "p"]).join(xb, rsuffix="_b")
+        rec = {"매도 기준": xn}
+        for pn, a, b in periods:
+            ps = perf_stats(r.loc[a:b])
+            jj = j.xs(pn, level="p")
+            rec[pn] = (f"{pct(ps['cagr'])} · {pct(ps['mdd'])} · {ps['sharpe']:.2f} / "
+                       f"{jj.sharpe.median():.2f}, {(jj.sharpe > jj.sharpe_b).sum()}/{len(jj)}")
+        for name in ("2008 금융위기", "2020 코로나", "2025 관세 충격"):
+            a, b = CRISES[name]
+            rec[name] = pct(mdd(r.loc[a:b]))
+        rows.append(rec)
+    table(pd.DataFrame(rows))
+    XT = pd.DataFrame(xtrades)
+    out(f"### 매매 단위 (점검 시작 전까지 끝난 매매)\n")
+    rows = []
+    for xn, d in XT.groupby("v", sort=False):
+        pos_sum = d.ret[d.ret > 0].sum()
+        rows.append({"매도 기준": xn, "매매 수": len(d), "매도 때 점수 (중앙값)": f"{d.exit_s.median():.0f}",
+                     "매도가: 보유 중 고점 대비": pct(d.from_peak.median()), "매수가 대비 (중앙값)": pct(d.ret.median()),
+                     "매수가 대비 (평균)": pct(d.ret.mean()), "30% 넘게 번 매매": int((d.ret > 0.3).sum()),
+                     "상위 10% 매매의 이익 비중": pct(d.ret.sort_values(ascending=False).head(len(d) // 10).sum() / pos_sum),
+                     "재매수가 > 매도가": pct((d.rebuy.dropna() > 0).mean()), "보유 거래일": f"{d.days.median():.0f}"})
+    table(pd.DataFrame(rows))
+    cur = XT[XT.v == "현재 (200일선 아래 + 40)"].copy()
+    cur["구간"] = pd.cut(cur.entry_s, [69.9, 80, 90, 101], labels=["70~80", "80~90", "90~100"])
+    rows = [{"매수 때 3일 평균": str(k), "매매 수": len(d), "승률": pct((d.ret > 0).mean()), "매수가 대비 평균": pct(d.ret.mean()),
+             "중앙값": pct(d.ret.median()), "매도가: 고점 대비": pct(d.from_peak.median()), "보유 거래일": f"{d.days.median():.0f}"}
+            for k, d in cur.groupby("구간", observed=True)]
+    out("### 현재 규칙: 매수 때 점수 구간별\n")
     table(pd.DataFrame(rows))
 
     if args.md:

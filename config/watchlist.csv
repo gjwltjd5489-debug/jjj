@@ -2,7 +2,9 @@ group,ticker,name,bench
 지수,SPY,S&P 500,
 지수,QQQ,나스닥100,SPY
 지수,IWM,러셀2000,SPY
-지수,VTV,미국 가치주,SPY
+섹터·스타일,VTV,미국 가치주,SPY
+섹터·스타일,SCHD,미국 배당성장,SPY
+섹터·스타일,SOXX,반도체,QQQ
 해외 증시,EWY,한국,SPY
 해외 증시,EWJ,일본,SPY
 해외 증시,MCHI,중국,SPY

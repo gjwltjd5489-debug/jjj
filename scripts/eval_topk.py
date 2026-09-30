@@ -11,6 +11,7 @@
 
 예)
   python scripts/eval_topk.py --asof 2026-09-29 --md docs/results/topk_eval.md
+  python scripts/eval_topk.py --ns 70 75 80 85 90 95 100 --ks 5 8 10 --md docs/results/topk_eval_high_n.md
 """
 
 from __future__ import annotations
@@ -104,6 +105,8 @@ def main() -> None:
     ap.add_argument("--start", default="2005-01-01")
     ap.add_argument("--asof", default="2026-09-29")
     ap.add_argument("--md", help="결과 마크다운 저장")
+    ap.add_argument("--ns", type=float, nargs="+", default=list(NS), help="점수 기준 n 목록")
+    ap.add_argument("--ks", type=int, nargs="+", default=list(KS), help="보유 종목 수 k 목록")
     args = ap.parse_args()
 
     end = pd.Timestamp(args.asof)
@@ -166,11 +169,11 @@ def main() -> None:
         out("무작위 = 같은 후보 중 무작위 k개를 30번 뽑았을 때, 점수순이 그보다 샤프가 높았던 비율 (괄호: 무작위 샤프 중앙값)\n")
         rows = []
         for fn, every in FREQ.items():
-            for n in NS:
-                for k in KS:
+            for n in args.ns:
+                for k in args.ks:
                     r, turn, info = book.run(n, k, every, rule)
                     rnd = [book.run(n, k, every, rule, np.random.default_rng(sd))[0] for sd in range(SEEDS)]
-                    rec = row_of(f"{fn} n={n} k={k}", r, {"종목 수": f"{info['종목 수']:.1f}",
+                    rec = row_of(f"{fn} n={n:g} k={k}", r, {"종목 수": f"{info['종목 수']:.1f}",
                                                          "현금": f"{info['현금']:.0%}", "기술주": f"{info['기술주']:.0%}",
                                                          "회전율/년": f"{turn:.0f}"})
                     for pn, a, b in periods:

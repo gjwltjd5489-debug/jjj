@@ -151,7 +151,7 @@ def test_trade_signal_groups_buy_and_sell():
         TickerReport(ticker="B", sig=sig(score=83, score_s=75, held=True, event="BUY"), **base),
         TickerReport(ticker="S", sig=sig(score=33, score_s=38, event="SELL"), **base),
         TickerReport(ticker="K", sig=sig(score=83, score_s=80, blocked="과열"), **base),
-        TickerReport(ticker="N", sig=sig(score=50, score_s=45, held=True), **base),
+        TickerReport(ticker="N", sig=sig(score=50, score_s=45, held=True, above200=False), **base),
         TickerReport(ticker="H", sig=sig(score=83, score_s=83, held=True), **base),
     ]
     g = signal_groups(reps)
@@ -173,7 +173,8 @@ def test_trade_signal_on_real_like_series():
 def _rep(ticker="X", **sig):
     from scoring.checklist import TickerReport
     d = {"score": 50.0, "score_s": 50.0, "prev_score_s": 50.0, "proj": 50.0, "held": False, "event": "", "blocked": "",
-         "stop": 95.0, "close": 100.0, "above200": True, "overheat": False, "highvol": False, "recent": []}
+         "stop": 95.0, "close": 100.0, "above200": True, "ma200": float("nan"), "overheat": False, "highvol": False,
+         "recent": []}
     d.update(sig)
     return TickerReport(ticker=ticker, name="", group="", date=pd.Timestamp("2026-09-29"), close=100.0, change=0.0,
                         from_high=0.0, checks=[], sig=d)
@@ -183,22 +184,27 @@ def test_near_signals_use_tomorrow_projection():
     from scoring.checklist import make_subject, signal_groups
     reps = [_rep("NB", score=83, score_s=64, proj=72),                       # 내일 진입 가능
             _rep("NR", score=83, score_s=64, proj=72, above200=False),       # 가능하지만 200일선 아래
-            _rep("NE", score=33, score_s=55, proj=39, held=True),            # 내일 퇴출 가능
+            _rep("NE", score=33, score_s=55, proj=39, held=True, above200=False),  # 200일선 아래, 내일 퇴출 가능
+            _rep("UP", score=33, score_s=55, proj=39, held=True),            # 200일선 위라 점수로는 안 판다
+            _rep("PB", score=17, score_s=30, proj=25, held=True, ma200=95.0),  # 눌림 (보유 유지)
             _rep("H", score=83, score_s=80, proj=81, held=True)]
     g = signal_groups(reps)
     assert [r.ticker for r, _ in g["near_buy"]] == ["NB", "NR"] and "진입 보류" in g["near_buy"][1][1]
     assert [r.ticker for r, _ in g["near_exit"]] == ["NE"] and "매도 신호" in g["near_exit"][0][1]
-    assert [r.ticker for r, _ in g["hold"]] == ["H"]
+    assert [r.ticker for r, _ in g["pullback"]] == ["PB"] and "200일선 95.00 (종가가 +5.3%)" in g["pullback"][0][1]
+    assert [r.ticker for r, _ in g["hold"]] == ["H", "UP"]
     subj = make_subject(reps, {"mode": "normal", "failed": []})
-    assert subj.startswith("[미장] 9/29 · 매수 없음 · 매도 없음") and "NB↑" in subj and "NE↓" in subj
+    assert subj.startswith("[미장] 9/29 · 매수 없음 · 매도 없음") and "NB↑" in subj and "NE↓" in subj and "눌림 PB" in subj
 
 
 def test_holdings_table_shows_stop_and_room():
     from scoring.checklist import holdings, render_html, render_text
-    reps = [_rep("A", score_s=75, held=True, stop=96.0), _rep("B", score_s=90, held=True, event="BUY"), _rep("C")]
+    reps = [_rep("A", score_s=75, held=True, stop=96.0, ma200=80.0), _rep("B", score_s=90, held=True, event="BUY"),
+            _rep("C")]
     assert [r.ticker for r in holdings(reps)] == ["B", "A"]
     text = render_text(reps, {"mode": "normal", "failed": []})
-    assert "A 75 · 종가 100.00 · 손절 참고 96.00 (-4.0%) · 퇴출선까지 35점" in text
+    assert "A 75 · 종가 100.00 · 손절 참고 96.00 (-4.0%) · 200일선 +25.0% · 점수 여유 35" in text
+    assert "매도 조건까지" in render_html(reps, {"mode": "normal", "failed": []})
 
 
 def test_color_only_changes_and_no_hover_text():

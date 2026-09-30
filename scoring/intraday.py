@@ -20,7 +20,8 @@ from .profiles import Profile
 
 GAP_MIN = 0.02      # 시가 갭 경고 최소폭
 STOP_NEAR = 0.01    # 손절 참고가 위 1% 이내면 '근접'
-STEP = 50 / 6       # 점수 한 칸 (방향 성향 6개일 때 🟠 하나가 🟢·🔴로 바뀌는 폭)
+STEP = 50 / 6       # 점수 한 칸 (배점 1인 성향 하나가 🟠에서 🟢·🔴로 바뀌는 폭, 성향 6개 기준)
+MA200_NEAR = 0.02   # 눌림 중인 보유 종목이 200일선 위 2% 이내면 '200일선 근접'
 
 
 @dataclass
@@ -43,7 +44,8 @@ class IntradayRow:
 def _last(o: pd.DataFrame) -> dict:
     r = o.iloc[-1]
     return {k: (r[k].item() if hasattr(r[k], "item") else r[k])
-            for k in ("score", "score_s", "state", "event", "blocked", "stop", "above200", "overheat", "highvol", "close")}
+            for k in ("score", "score_s", "state", "event", "blocked", "stop", "above200", "overheat", "highvol", "close",
+                      "ma200")}
 
 
 def provisional_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -115,8 +117,13 @@ def classify(r: IntradayRow) -> list[tuple[str, str]]:
         # 신호선 한 칸(성향 6개 기준 약 8점) 안쪽. 아침에 이미 '진입 보류'였던 종목(과열 등)은 매일 반복되므로 뺀다.
         if not held and not m.get("blocked") and not p.get("blocked") and RULE.entry - STEP <= p["score_s"] < RULE.entry:
             notes.append(("near_buy", f"{ps} (진입 {RULE.entry:g}, 아침 {m['score_s']:.0f}) · {now}"))
-        elif held and p["score_s"] <= RULE.exit + STEP:
-            notes.append(("near_sell", f"{ps} (퇴출 {RULE.exit:g}, 아침 {m['score_s']:.0f}) · {now}"))
+        elif held and not p.get("above200", True) and p["score_s"] <= RULE.exit + STEP:
+            notes.append(("near_sell", f"200일선 아래 · {ps} (퇴출 {RULE.exit:g}, 아침 {m['score_s']:.0f}) · {now}"))
+        elif (held and p.get("above200", True) and p["score_s"] <= RULE.exit and pd.notna(p.get("ma200"))
+              and r.price <= p["ma200"] * (1 + MA200_NEAR)):
+            # 200일선 위 눌림: 점수는 이미 퇴출선 아래라 200일선을 깨면 매도 신호
+            notes.append(("near_sell", f"눌림 중 200일선 {p['ma200']:,.2f} 근접 ({r.price / p['ma200'] - 1:+.1%}) — "
+                                       f"종가가 200일선 아래면 매도 신호 · {ps} · {now}"))
     if m.get("state") == 1 and m.get("event") != "SELL" and pd.notna(m.get("stop")):
         if r.price < m["stop"]:
             notes.append(("stop_break", f"손절 참고가 {m['stop']:,.2f} 이탈 · {now}"))

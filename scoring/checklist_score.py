@@ -1,13 +1,16 @@
 """체크리스트 점수와 매수·매도 규칙 — 메일의 '성향별 판정'과 같은 기준.
 
 점수 (0~100, 50 = 중립)
-    = 50 + 50 × (🟢 성향 수 − 🔴 성향 수) ÷ 판정 가능한 방향 성향 수
-    방향 성향: 장기 추세 · 중기 추세 · 모멘텀 · 추세 강도 · 거래량 · 상대강도(벤치마크가 있을 때만)
-    🟠(혼조·횡보·약함)은 0, ⚪(해당 없음)은 분모에서 뺀다. 메일 표의 색만 세면 누구나 다시 계산할 수 있다.
+    = 50 + 50 × Σ(배점 × 색) ÷ Σ(판정 가능한 성향의 배점)      색: 🟢 +1, 🟠 0, 🔴 −1, ⚪ 제외
+    방향 성향과 배점: 장기 추세 ×2 · 중기 추세 ×1 · 모멘텀 ×0.5 · 추세 강도 ×1 · 거래량 ×0.5 · 상대강도 ×1
+    (상대강도는 벤치마크가 있을 때만). 메일 표의 색과 배점만으로 누구나 다시 계산할 수 있다.
+    배점 근거: 2006~2017 데이터에서 장기 추세가 이후 하락 위험을 가장 잘 갈랐고, 모멘텀·거래량은
+    정보가 적은데 연 40회 넘게 색이 바뀌었다 (docs/signal_review.md 5장).
 
-매수·매도 규칙 (결과를 보고 맞춘 값이 아니라 먼저 정한 값)
+매수·매도 규칙
     진입: 3일 평균 점수 ≥ 70, 종가 > 200일선, 과열(50일선 이격 1년 상위 5%)·고변동(변동성 1년 상위 20%) 아님
-    퇴출: 3일 평균 점수 ≤ 40
+    퇴출: 3일 평균 점수 ≤ 40 **그리고 종가 < 200일선** — 200일선 위에서는 점수가 낮아도 눌림으로 보고 보유
+          (2025-09 ~ 2026-09 사후 점검 뒤 추가, 2006~2017 데이터에서도 개선 확인: docs/signal_review.md)
     손절 참고가: 종가 − 2 × ATR(14)
 
 항목 판정은 scoring/checklist.py 의 build_report 와 같아야 한다 (tests/test_checklist_score.py 에서 검사).
@@ -33,6 +36,8 @@ FAMILY_ITEMS = {
     "상대강도": ["상대강도"],
 }
 CORE_FAMILIES = ["장기 추세", "중기 추세", "모멘텀", "추세 강도"]
+WEIGHTS = {"장기 추세": 2.0, "중기 추세": 1.0, "모멘텀": 0.5, "추세 강도": 1.0, "거래량": 0.5, "상대강도": 1.0}
+EQUAL = {f: 1.0 for f in FAMILY_ITEMS}
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,8 @@ class ScoreRule:
     exit: float = 40           # 3일 평균 점수가 이 이하이면 퇴출
     smooth: int = 3            # 점수 평활 기간(일)
     near_exit: float = 50      # 보유 구간인데 이 이하이면 '청산 임박'
+    exit_above200: float | None = None  # 200일선 위일 때의 퇴출선 (None = 200일선 위에서는 점수로 퇴출하지 않음)
+    weights: tuple[tuple[str, float], ...] = tuple(WEIGHTS.items())
     need_above_200: bool = True
     block_overheat: bool = True
     block_highvol: bool = True
@@ -94,18 +101,22 @@ def family_verdicts(states: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out, index=states.index)
 
 
-def score_from_verdicts(fv: pd.DataFrame, required: list[str] | None = None) -> pd.Series:
-    n = fv.notna().sum(axis=1)
-    raw = 50 + 50 * fv.sum(axis=1) / n.replace(0, np.nan)
+def score_from_verdicts(fv: pd.DataFrame, required: list[str] | None = None,
+                        weights: dict[str, float] | None = None) -> pd.Series:
+    w = pd.Series({c: (weights or EQUAL).get(c, 1.0) for c in fv.columns}, dtype=float)
+    den = (fv.notna().astype(float) * w).sum(axis=1)
+    raw = 50 + 50 * (fv.fillna(0) * w).sum(axis=1) / den.replace(0, np.nan)
     if required:
         raw = raw.where(fv[[f for f in required if f in fv.columns]].notna().all(axis=1))
     return raw
 
 
-def points_from_verdicts(verdicts: dict[str, int | None]) -> float:
+def points_from_verdicts(verdicts: dict[str, int | None], weights: dict[str, float] | None = None) -> float:
     """오늘 하루치 판정(+1/0/−1, None = 해당 없음) → 점수. 메일 표에서 바로 계산하는 방식."""
-    vals = [v for v in verdicts.values() if v is not None]
-    return float("nan") if not vals else 50 + 50 * sum(vals) / len(vals)
+    w = weights or EQUAL
+    vals = [(v, w.get(k, 1.0)) for k, v in verdicts.items() if v is not None]
+    den = sum(x for _, x in vals)
+    return float("nan") if not vals or den == 0 else 50 + 50 * sum(v * x for v, x in vals) / den
 
 
 def run_rule(score_s: np.ndarray, above200: np.ndarray, overheat: np.ndarray, highvol: np.ndarray,
@@ -136,7 +147,8 @@ def run_rule(score_s: np.ndarray, above200: np.ndarray, overheat: np.ndarray, hi
             else:
                 cur = 1.0
                 events[k] = "BUY"
-        elif cur == 1 and s <= rule.exit:
+        elif cur == 1 and s <= (rule.exit if not above200[k] else
+                                (rule.exit_above200 if rule.exit_above200 is not None else -np.inf)):
             cur = 0.0
             events[k] = "SELL"
         state[k] = cur
@@ -154,7 +166,7 @@ def checklist_score(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None
         required.append("거래량")
     if bench is not None:
         required.append("상대강도")
-    score = score_from_verdicts(fv, required)
+    score = score_from_verdicts(fv, required, dict(rule.weights))
     score_s = score.rolling(rule.smooth).mean() if rule.smooth > 1 else score
     # 오늘 점수가 내일도 그대로일 때의 내일 평균 (신호 임박 판단용)
     proj = score_s + (score - score.shift(rule.smooth - 1)) / rule.smooth if rule.smooth > 1 else score
@@ -167,7 +179,7 @@ def checklist_score(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None
         "close": x["close"], "score": score, "score_s": score_s, "proj": proj,
         "above200": above200, "overheat": overheat, "highvol": highvol,
         "state": state, "event": events, "blocked": blocked,
-        "stop": x["close"] - rule.stop_atr * atr(df, 14),
+        "stop": x["close"] - rule.stop_atr * atr(df, 14), "ma200": x["ma_long"],
     }, index=x.index)
     return out.join(fv.add_prefix("f_"))
 

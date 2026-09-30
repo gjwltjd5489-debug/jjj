@@ -340,7 +340,7 @@ DOC_URL = "https://github.com/gjwltjd5489-debug/jjj/blob/claude/festive-johnson-
 def checklist_points(checks: list[Check]) -> float:
     """메일 표의 방향 성향 색으로 계산하는 점수 (🟢 +1, 🟠 0, 🔴 −1, ⚪ 제외)."""
     dirs = [g for g, _, kind in GROUPS if kind == "dir"]
-    return points_from_verdicts({g: _POINT.get(verdict(checks, g), 0) for g in dirs})
+    return points_from_verdicts({g: _POINT.get(verdict(checks, g), 0) for g in dirs}, dict(RULE.weights))
 
 
 def color_counts(checks: list[Check]) -> tuple[int, int, int]:
@@ -365,7 +365,7 @@ def trade_signal(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None) -
             "prev_score_s": float(o["score_s"].iloc[-2]) if len(o) > 1 else np.nan,
             "proj": float(last["proj"]), "held": bool(last["state"] == 1),
             "event": last["event"], "blocked": last["blocked"], "stop": float(last["stop"]),
-            "close": float(last["close"]), "above200": bool(last["above200"]),
+            "close": float(last["close"]), "above200": bool(last["above200"]), "ma200": float(last["ma200"]),
             "overheat": bool(last["overheat"]), "highvol": bool(last["highvol"]), "recent": recent}
 
 
@@ -387,12 +387,19 @@ def _stop_text(g: dict) -> str:
     return f"손절 참고 {g['stop']:,.2f} ({g['stop'] / g['close'] - 1:+.1%})"
 
 
+def _ma200_text(g: dict) -> str:
+    ma = g.get("ma200", np.nan)
+    return "200일선 –" if pd.isna(ma) else f"200일선 {ma:,.2f} (종가가 {g['close'] / ma - 1:+.1%})"
+
+
 def signal_groups(reports: list[TickerReport]) -> dict[str, list[tuple[TickerReport, str]]]:
-    """buy / sell / blocked(진입 보류) / near_buy(진입 임박) / near_exit(청산 임박) / hold(그 밖의 보유 구간).
+    """buy / sell / blocked(진입 보류) / near_buy(진입 임박) / near_exit(청산 임박) / pullback(눌림, 보유 유지)
+    / hold(그 밖의 보유 구간).
 
     임박 = 당일 점수가 내일도 같으면 내일 3일 평균이 진입선·퇴출선을 넘는 경우 (청산 임박은 3일 평균 50 이하도 포함).
+    퇴출은 200일선 아래에서만 나므로 청산 임박도 200일선 아래 종목만. 200일선 위에서 점수가 퇴출선 아래면 '눌림'.
     """
-    out = {k: [] for k in ("buy", "sell", "blocked", "near_buy", "near_exit", "hold")}
+    out = {k: [] for k in ("buy", "sell", "blocked", "near_buy", "near_exit", "pullback", "hold")}
     for r in reports:
         g = r.sig
         if not g:
@@ -412,8 +419,14 @@ def signal_groups(reports: list[TickerReport]) -> dict[str, list[tuple[TickerRep
                 risk = _entry_risks(g)
                 out["near_buy"].append((r, f"{s_txt} · 당일 점수가 내일도 같으면 내일 평균 {proj:.0f} → 매수 신호"
                                            + (f" (단, 지금은 {'·'.join(risk)}라 진입 보류)" if risk else "")))
+        elif g.get("above200", True) and RULE.exit_above200 is None:
+            if g["score_s"] <= RULE.exit:
+                out["pullback"].append((r, f"3일 평균 {g['score_s']:.0f} ≤ {RULE.exit:g}이지만 200일선 위라 보유 유지 · "
+                                           f"{_ma200_text(g)} · 200일선을 깨면 매도"))
+            else:
+                out["hold"].append((r, f"{g['score_s']:.0f}"))
         elif g["score_s"] <= RULE.near_exit or (pd.notna(proj) and proj <= RULE.exit):
-            t = f"3일 평균 {g['score_s']:.0f} (퇴출선 {RULE.exit:g}까지 {g['score_s'] - RULE.exit:.0f})"
+            t = f"200일선 아래 · 3일 평균 {g['score_s']:.0f} (퇴출선 {RULE.exit:g}까지 {g['score_s'] - RULE.exit:.0f})"
             if pd.notna(proj) and proj <= RULE.exit:
                 t += f" · 당일 점수가 내일도 같으면 내일 평균 {proj:.0f} → 매도 신호"
             out["near_exit"].append((r, t))
@@ -429,30 +442,40 @@ def holdings(reports: list[TickerReport]) -> list[TickerReport]:
     return sorted((r for r in reports if r.sig and r.sig["held"]), key=lambda r: -r.sig["score_s"])
 
 
-RULE_LINE = (f"점수 = 방향 성향 6개(장기·중기·모멘텀·추세·거래량·상대)의 (🟢 수 − 🔴 수) ÷ 판정 가능 수를 0~100으로 환산 "
-             f"(50 = 중립). 진입: 3일 평균 {RULE.entry:g} 이상 + 200일선 위 + 과열·고변동 아님 · "
-             f"퇴출: 3일 평균 {RULE.exit:g} 이하 · 손절 참고가 = 종가 − {RULE.stop_atr:g}×ATR(14).")
-VALID_LINE = ("검증(27종목, 2006~2026): 계속 보유 대비 최대낙폭 −59%→−29%, 연수익 8.2%→4.9%. "
+RULE_LINE = (f"점수 = 방향 성향 6개의 가중 합 (🟢 +1 · 🟠 0 · 🔴 −1, 장기 ×2 · 모멘텀·거래량 ×0.5 · 나머지 ×1)을 "
+             f"0~100으로 환산 (50 = 중립). 진입: 3일 평균 {RULE.entry:g} 이상 + 200일선 위 + 과열·고변동 아님 · "
+             f"퇴출: 200일선 아래 + 3일 평균 {RULE.exit:g} 이하 (200일선 위에서는 눌림으로 보고 보유) · "
+             f"손절 참고가 = 종가 − {RULE.stop_atr:g}×ATR(14).")
+VALID_LINE = ("검증(29종목, 2006~2026, 종목 중앙값): 계속 보유 대비 최대낙폭 −59%→−34%, 연수익 8.5%→6.9%, 매매 연 1.3회. "
               "점수는 수익 예측이 아니라 하락 위험을 줄이는 용도. 매매 권유가 아님.")
 _SIG_LABEL = {"buy": ("bg", "🟢 매수"), "sell": ("br", "🔴 매도"), "blocked": ("bn", "⚠️ 진입 보류"),
-              "near_buy": ("bg", "🟢 진입 임박"), "near_exit": ("bo", "🟠 청산 임박")}
+              "near_buy": ("bg", "🟢 진입 임박"), "near_exit": ("bo", "🟠 청산 임박"),
+              "pullback": ("bn", "🟠 눌림 (보유 유지)")}
 
 
 def _signal_items(reports: list[TickerReport]) -> list[tuple[str, TickerReport | None, str]]:
     """(종류, 종목, 설명). 신규 매수·매도가 없으면 한 줄로 줄인다."""
     g = signal_groups(reports)
     items = [(k, r, t) for k in ("buy", "sell") for r, t in g[k]] or [("none", None, "오늘 신규 매수·매도 신호 없음")]
-    return items + [(k, r, t) for k in ("blocked", "near_buy", "near_exit") for r, t in g[k]]
+    return items + [(k, r, t) for k in ("blocked", "near_buy", "near_exit", "pullback") for r, t in g[k]]
 
 
 def _signal_lines(reports: list[TickerReport]) -> list[str]:
     return [t if r is None else f"{_SIG_LABEL[k][1]} {r.ticker} — {t}" for k, r, t in _signal_items(reports)]
 
 
+def _exit_room(g: dict) -> tuple[str, str]:
+    """(200일선 대비 종가, 점수 여유). 퇴출 = 200일선 아래 + 3일 평균 40 이하."""
+    ma = g.get("ma200", np.nan)
+    trend = "200일선 –" if pd.isna(ma) else (f"200일선 {g['close'] / ma - 1:+.1%}" if g["close"] >= ma else "200일선 아래")
+    room = g["score_s"] - RULE.exit
+    return trend, (f"점수 여유 {room:.0f}" if room > 0 else "점수는 퇴출선 아래")
+
+
 def _holding_text(r: TickerReport) -> str:
     g = r.sig
-    return (f"{r.ticker} {g['score_s']:.0f} · 종가 {g['close']:,.2f} · {_stop_text(g)} · "
-            f"퇴출선까지 {g['score_s'] - RULE.exit:.0f}점")
+    trend, room = _exit_room(g)
+    return f"{r.ticker} {g['score_s']:.0f} · 종가 {g['close']:,.2f} · {_stop_text(g)} · {trend} · {room}"
 
 
 def _sc_badge(v: float) -> str:
@@ -476,17 +499,20 @@ def _signal_html(reports: list[TickerReport]) -> str:
     if hs:
         parts.append(f"<p style='margin:10px 0 2px'><b>규칙상 보유 구간 {len(hs)}종목</b> "
                      f"<span class='m' style='font-size:11px'>손절 참고가 = 종가 − {RULE.stop_atr:g}×ATR(14)</span></p>"
-                     "<table><tr><th>종목</th><th>3일 평균</th><th>종가</th><th>손절 참고가</th><th>퇴출까지</th></tr>")
+                     "<table class='tb'><tr><th class='s'>종목</th><th class='s'>점수<br>3일평균</th><th class='s'>종가</th>"
+                     "<th class='s'>손절<br>참고가</th><th class='s'>매도 조건까지<br>200일선 · 점수</th></tr>")
         for r in hs:
             g = r.sig
-            stop = (f"{g['stop']:,.2f}<br><span class='m' style='font-size:11px'>{g['stop'] / g['close'] - 1:+.1%}</span>"
+            stop = (f"{g['stop']:,.2f}<br><span class='s10'>{g['stop'] / g['close'] - 1:+.1%}</span>"
                     if pd.notna(g["stop"]) else "–")
-            room = f"{g['score_s'] - RULE.exit:.0f}점"
-            if g["score_s"] <= RULE.near_exit:
-                room = f"<span class='wr'>{room}</span>"
-            parts.append(f"<tr><td class='l'><b>{e(r.ticker)}</b><br><span class='m nm'>{e(r.name)}</span></td>"
-                         f"<td class='c'>{_sc_badge(g['score_s'])}</td><td class='c'>{g['close']:,.2f}</td>"
-                         f"<td class='c'>{stop}</td><td class='c'>{room}</td></tr>")
+            ma, room = g.get("ma200", np.nan), g["score_s"] - RULE.exit
+            trend = ("–" if pd.isna(ma) else f"{g['close'] / ma - 1:+.1%}" if g["close"] >= ma
+                     else "<span class='wr'>200일선 아래</span>")
+            room = f"여유 {room:.0f}" if room > 0 else "<span class='wr'>퇴출선 아래</span>"
+            parts.append(f"<tr><td class='l' style='font-size:13px'><b>{e(r.ticker)}</b><br><span class='m nm'>{e(r.name)}</span></td>"
+                         f"<td class='c'>{_sc_badge(g['score_s'])}</td><td class='c' style='font-size:12px'>{g['close']:,.2f}</td>"
+                         f"<td class='c' style='font-size:12px'>{stop}</td>"
+                         f"<td class='c' style='font-size:12px'>{trend}<br><span class='s10'>{room}</span></td></tr>")
         parts.append("</table>")
     parts.append("</div>")
     return "".join(parts)
@@ -577,7 +603,8 @@ _BADGE_CSS = (".ck .b{display:inline-block;padding:2px 4px;border-radius:4px;fon
 
 # ---------------------------------------------------------------- 출력
 
-LEGEND = ("🟢 강세·정상 · 🟠 혼조·주의 · 🔴 약세 · ⚪ 해당 없음 · 노란 칸 = 전일과 색이 바뀐 성향 · 과열 칸의 🟠은 과열 또는 과매도. "
+LEGEND = ("🟢 강세·정상 · 🟠 혼조·주의 · 🔴 약세 · ⚪ 해당 없음 · 노란 칸 = 전일과 색이 바뀐 성향 · 과열 칸의 🟠은 과열 또는 과매도 · "
+          "머리글 ×2·×½ = 점수 배점. "
           "장기 = 200일선·이평 배열 · 중기 = 일목 구름·전환/기준 · 모멘텀 = MACD 시그널·RSI 50 · 추세 = ADX≥25와 DMI 방향 · "
           "거래량 = VR 1년 백분위 50%·OBV 20일 증감 · 상대 = 벤치마크(SPY, 비트코인·반도체는 QQQ) 대비 비율의 50일 평균 · "
           "변동성 = 20일 변동성 1년 상위 20%면 🟠 · 과열 = 50일선 이격도 1년 상위 5%(과열)·하위 5%(과매도)면 🟠.")
@@ -714,6 +741,8 @@ def make_subject(reports: list[TickerReport], meta: dict) -> str:
     near = [r.ticker + "↑" for r, _ in g["near_buy"]] + [r.ticker + "↓" for r, _ in g["near_exit"]]
     if near:
         parts.append("임박 " + " ".join(near))
+    if g["pullback"]:
+        parts.append(f"눌림 {names('pullback')}")
     subject = f"[미장] {date.month}/{date.day} · " + " · ".join(parts)
     if q:
         subject = "[점검 필요] " + subject
@@ -738,7 +767,7 @@ def _sections(reports: list[TickerReport], meta: dict) -> list[tuple[str, list[s
         secs.append(("오늘의 매수·매도 신호", _signal_lines(reports)))
         hs = holdings(reports)
         if hs:
-            secs.append((f"규칙상 보유 구간 {len(hs)}종목 (3일 평균 · 종가 · 손절 참고가 · 퇴출선까지)",
+            secs.append((f"규칙상 보유 구간 {len(hs)}종목 (3일 평균 · 종가 · 손절 참고가 · 종가의 200일선 대비 · 점수 여유)",
                          [_holding_text(r) for r in hs]))
     look = market_lines(reports, meta) + _headline(reports)
     if meta.get("calendar_note"):
@@ -826,7 +855,10 @@ def _table_html(reports: list[TickerReport]) -> str:
     """성향별 판정 표: 점수(3일 평균, 당일) · 종가/등락/고점대비 · 성향 8개 (색 동그라미 + 짧은 라벨)."""
     e = html.escape
     parts = ["<table class='tb'><tr><th class='s'>종목</th><th class='s'>점수<br>3일평균</th><th class='s'>종가</th>"]
-    parts += [f"<th class='s'>{e(SHORT[g])}</th>" for g, _, _ in GROUPS]
+    wts = dict(RULE.weights)
+    mark = {2.0: "×2", 0.5: "×½"}
+    parts += [f"<th class='s'>{e(SHORT[g])}" + (f"<br><span style='font-weight:normal'>{mark[wts[g]]}</span>"
+                                                 if wts.get(g) in mark else "") + "</th>" for g, _, _ in GROUPS]
     parts.append("</tr>")
     group = None
     for r in reports:

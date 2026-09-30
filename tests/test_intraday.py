@@ -16,7 +16,7 @@ def row(m, p, price=100.0, prev=100.0, open_=100.0, atr_pct=0.01):
 
 
 BASE = {"score": 80.0, "score_s": 75.0, "state": 1.0, "event": "", "blocked": "", "stop": 95.0,
-        "above200": True, "overheat": False, "highvol": False, "close": 100.0}
+        "above200": True, "overheat": False, "highvol": False, "close": 100.0, "ma200": 90.0}
 
 
 def test_buy_keep_weak_cancel():
@@ -73,7 +73,13 @@ def test_near_entry_and_exit_lines():
     assert row(dict(BASE, state=0.0, score_s=58.0), dict(BASE, state=0.0, score_s=66.0)) == {"near_buy"}
     assert row(dict(BASE, state=0.0, score_s=58.0), dict(BASE, state=0.0, score_s=60.0)) == set()   # 한 칸 밖
     assert row(dict(BASE, state=0.0, blocked="과열"), dict(BASE, state=0.0, score_s=66.0)) == set()  # 아침 보류는 반복 안 함
-    assert row(dict(BASE, score_s=55.0), dict(BASE, score_s=45.0)) == {"near_sell"}
+    # 200일선 아래 보유 종목: 점수가 퇴출선 한 칸 안
+    assert row(dict(BASE, score_s=55.0), dict(BASE, score_s=45.0, above200=False)) == {"near_sell"}
+    # 200일선 위: 점수로는 팔지 않으므로 알리지 않는다
+    assert row(dict(BASE, score_s=55.0), dict(BASE, score_s=45.0)) == set()
+    # 눌림(점수 ≤ 40) 중에 200일선 2% 안으로 접근하면 알린다
+    assert row(dict(BASE, score_s=38.0), dict(BASE, score_s=35.0, ma200=98.5), price=100.0) == {"near_sell"}
+    assert row(dict(BASE, score_s=38.0), dict(BASE, score_s=35.0, ma200=90.0), price=100.0) == set()
 
 
 def test_table_keeps_alerts_and_holdings_and_summarises_rest():

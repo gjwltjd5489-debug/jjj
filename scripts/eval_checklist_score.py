@@ -1,6 +1,6 @@
 """체크리스트 점수 규칙 검증: watchlist 전 종목, 실제 데이터.
 
-비교: 보유(buy & hold) / 이전 규칙(v6 조합 카드) / 새 체크리스트 점수 규칙
+비교: 보유(buy & hold) / v6 조합 카드 / 이전 점수 규칙(동일 배점, 어디서나 40 퇴출) / 현재 점수 규칙(배점 + 200일선 위 보유)
 - 종목별 CAGR·MDD·샤프·노출·연간 매매 횟수, 기간 분할(앞/뒤)
 - 점수 구간별 이후 20일 수익률·변동성, 날짜별 종목 간 순위상관(점수 높은 종목이 다음 20일에 더 올랐나)
 - 임계값·평활·위험 차단 민감도
@@ -24,13 +24,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
-from scoring.checklist_score import RULE, checklist_score, strategy_returns  # noqa: E402
+from scoring.checklist_score import EQUAL, RULE, checklist_score, strategy_returns  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
 from scoring.score import compute_all  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
 
 BACKFILL = {"PDBC": "PDBC+DBC"}
 COST = 0.0005
+OLD = replace(RULE, weights=tuple(EQUAL.items()), exit_above200=RULE.exit)  # 2026-09 사후 점검 전 규칙
 
 
 def metrics(ret: pd.Series, state: pd.Series | None) -> dict:
@@ -60,7 +61,10 @@ def main() -> None:
         return cache[t]
 
     variants = {
-        "기본 (70/40, 3일 평균, 과열·고변동 차단)": RULE,
+        "현재 (배점 + 200일선 위 보유, 70/40, 3일 평균, 과열·고변동 차단)": RULE,
+        "이전 (동일 배점, 어디서나 40 퇴출)": OLD,
+        "배점만 바꿈 (어디서나 40 퇴출)": replace(RULE, exit_above200=RULE.exit),
+        "200일선 위 보유만 (동일 배점)": replace(RULE, weights=tuple(EQUAL.items())),
         "위험 차단 없음": replace(RULE, block_overheat=False, block_highvol=False),
         "평활 없음": replace(RULE, smooth=1),
         "진입 60 / 퇴출 40": replace(RULE, entry=60),
@@ -76,11 +80,13 @@ def main() -> None:
         bench = prices(row.bench)["Close"] if row.bench else None
         p = get_profile(t)
         new = checklist_score(df, p, bench)
+        old = checklist_score(df, p, bench, OLD)
         v6 = compute_all(df, p, ["v6"], bench)["v6"]
         start = max(new["score_s"].first_valid_index(), v6["total"].first_valid_index())
-        new, v6 = new.loc[start:], v6.loc[start:]
+        new, old, v6 = new.loc[start:], old.loc[start:], v6.loc[start:]
         bh = new["close"].pct_change().fillna(0.0)
         r_new = strategy_returns(new, COST)
+        r_old = strategy_returns(old, COST)
         r_v6 = strategy_returns(v6, COST)
         for pname, a, b in periods:
             if len(bh.loc[a:b]) < 252:
@@ -88,6 +94,7 @@ def main() -> None:
             rows.append({"ticker": t, "period": pname, "start": bh.loc[a:b].index[0].date(),
                          **{f"bh_{k}": v for k, v in metrics(bh.loc[a:b], None).items()},
                          **{f"v6_{k}": v for k, v in metrics(r_v6.loc[a:b], v6["state"].loc[a:b]).items()},
+                         **{f"old_{k}": v for k, v in metrics(r_old.loc[a:b], old["state"].loc[a:b]).items()},
                          **{f"new_{k}": v for k, v in metrics(r_new.loc[a:b], new["state"].loc[a:b]).items()}})
         bh_all = perf_stats(bh)
         for vname, rule in variants.items():
@@ -121,22 +128,23 @@ def main() -> None:
             "종목": sub.ticker, "시작": sub.start,
             "보유 CAGR": sub.bh_cagr.map(pct), "보유 MDD": sub.bh_mdd.map(pct), "보유 샤프": sub.bh_sharpe.round(2),
             "v6 CAGR": sub.v6_cagr.map(pct), "v6 MDD": sub.v6_mdd.map(pct), "v6 샤프": sub.v6_sharpe.round(2),
+            "이전 CAGR": sub.old_cagr.map(pct), "이전 MDD": sub.old_mdd.map(pct), "이전 샤프": sub.old_sharpe.round(2),
             "새 CAGR": sub.new_cagr.map(pct), "새 MDD": sub.new_mdd.map(pct), "새 샤프": sub.new_sharpe.round(2),
             "새 노출": sub.new_exposure.map(pct), "새 매매/년": sub.new_trades_per_year.round(1),
         })
         out(tbl.to_markdown(index=False) if _tab() else tbl.to_string(index=False))
         out("")
-        out("| 요약 (종목 중앙값) | 보유 | 이전 규칙 v6 | 새 점수 규칙 |")
-        out("|---|---:|---:|---:|")
-        out(f"| CAGR | {pct(sub.bh_cagr.median())} | {pct(sub.v6_cagr.median())} | {pct(sub.new_cagr.median())} |")
-        out(f"| MDD | {pct(sub.bh_mdd.median())} | {pct(sub.v6_mdd.median())} | {pct(sub.new_mdd.median())} |")
-        out(f"| 샤프 | {sub.bh_sharpe.median():.2f} | {sub.v6_sharpe.median():.2f} | {sub.new_sharpe.median():.2f} |")
-        out(f"| 노출 | 100% | {pct(sub.v6_exposure.median())} | {pct(sub.new_exposure.median())} |")
-        out(f"| 매매/년 | – | {sub.v6_trades_per_year.median():.1f} | {sub.new_trades_per_year.median():.1f} |")
+        out("| 요약 (종목 중앙값) | 보유 | v6 조합 카드 | 이전 점수 규칙 | 현재 점수 규칙 |")
+        out("|---|---:|---:|---:|---:|")
+        out(f"| CAGR | {pct(sub.bh_cagr.median())} | {pct(sub.v6_cagr.median())} | {pct(sub.old_cagr.median())} | {pct(sub.new_cagr.median())} |")
+        out(f"| MDD | {pct(sub.bh_mdd.median())} | {pct(sub.v6_mdd.median())} | {pct(sub.old_mdd.median())} | {pct(sub.new_mdd.median())} |")
+        out(f"| 샤프 | {sub.bh_sharpe.median():.2f} | {sub.v6_sharpe.median():.2f} | {sub.old_sharpe.median():.2f} | {sub.new_sharpe.median():.2f} |")
+        out(f"| 노출 | 100% | {pct(sub.v6_exposure.median())} | {pct(sub.old_exposure.median())} | {pct(sub.new_exposure.median())} |")
+        out(f"| 매매/년 | – | {sub.v6_trades_per_year.median():.1f} | {sub.old_trades_per_year.median():.1f} | {sub.new_trades_per_year.median():.1f} |")
         n = len(sub)
-        out(f"| MDD가 보유보다 작은 종목 | – | {(sub.v6_mdd > sub.bh_mdd).sum()}/{n} | {(sub.new_mdd > sub.bh_mdd).sum()}/{n} |")
-        out(f"| 샤프가 보유보다 높은 종목 | – | {(sub.v6_sharpe > sub.bh_sharpe).sum()}/{n} | {(sub.new_sharpe > sub.bh_sharpe).sum()}/{n} |")
-        out(f"| 샤프가 v6보다 높은 종목 | – | – | {(sub.new_sharpe > sub.v6_sharpe).sum()}/{n} |")
+        out(f"| MDD가 보유보다 작은 종목 | – | {(sub.v6_mdd > sub.bh_mdd).sum()}/{n} | {(sub.old_mdd > sub.bh_mdd).sum()}/{n} | {(sub.new_mdd > sub.bh_mdd).sum()}/{n} |")
+        out(f"| 샤프가 보유보다 높은 종목 | – | {(sub.v6_sharpe > sub.bh_sharpe).sum()}/{n} | {(sub.old_sharpe > sub.bh_sharpe).sum()}/{n} | {(sub.new_sharpe > sub.bh_sharpe).sum()}/{n} |")
+        out(f"| 샤프가 이전 점수 규칙보다 높은 종목 | – | – | – | {(sub.new_sharpe > sub.old_sharpe).sum()}/{n} |")
 
     out("\n## 점수(3일 평균) 구간별 이후 20일 (전 종목 합산, 구간 겹침 주의)")
     bins = [-1, 20, 40, 60, 80, 101]

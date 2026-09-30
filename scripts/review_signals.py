@@ -6,6 +6,9 @@
 4. 매도 휩쏘(매도가보다 비싸게 재매수)와 매매 단위 성과, 매도 시 200일선 위/아래
 5. 최근 1년 재진입이 막힌 날(과열·고변동·200일선 아래)과 그동안의 가격 변화
 6. 보완 규칙 후보를 2006~2017 / 2018~점검 전 / 최근 1년으로 나눠 검증 (최근 1년에만 맞춘 규칙은 과최적화)
+7. 배점: 성향별 정보량(2006~2017), 배점 후보 × 퇴출 방식, 점수 자체의 위험 구분력과 안정성
+
+1~6장은 점검 기간에 실제로 쓰던 이전 규칙(동일 배점, 어디서나 40 퇴출)으로 계산한다.
 
 예)
   python scripts/review_signals.py --asof 2026-09-29 --md docs/results/signal_review_eval.md
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
-from scoring.checklist_score import RULE, checklist_score, strategy_returns  # noqa: E402
+from scoring.checklist_score import EQUAL, RULE, WEIGHTS, checklist_score, strategy_returns  # noqa: E402
 from scoring.indicators import atr  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
 from scoring.score import compute_indicators  # noqa: E402
@@ -33,6 +37,18 @@ from scoring.sources import load_prices  # noqa: E402
 BACKFILL = {"PDBC": "PDBC+DBC"}
 COST = 0.0005
 HORIZONS = (5, 20, 60)
+
+# 점검 기간에 쓰던 규칙: 동일 배점, 200일선 위에서도 40이면 퇴출
+OLD = replace(RULE, weights=tuple(EQUAL.items()), exit_above200=RULE.exit)
+FAM = list(WEIGHTS)
+WEIGHT_SETS = {
+    "W0 동일 (이전)": EQUAL,
+    "W1 장기 ×2": {**EQUAL, "장기 추세": 2.0},
+    "W2 시간축 계층 (장기 3·중기 2)": {**EQUAL, "장기 추세": 3.0, "중기 추세": 2.0},
+    "W3 모멘텀·거래량 ×0.5": {**EQUAL, "모멘텀": 0.5, "거래량": 0.5},
+    "W4 장기 ×2 + 모멘텀·거래량 ×0.5 (채택)": WEIGHTS,
+    "W5 데이터형 (2006~2017 회귀)": {"장기 추세": 2.5, "중기 추세": 1.0, "모멘텀": 0.5, "추세 강도": 1.0, "거래량": 0.0, "상대강도": 0.0},
+}
 
 # 보완 규칙 후보 — exit_above: 200일선 위일 때 퇴출선 (None = 점수로 퇴출하지 않음)
 VARIANTS = {
@@ -51,7 +67,7 @@ CRISES = {"2008 금융위기": ("2007-10-01", "2009-03-31"), "2011 유럽위기"
           "2025 관세 충격": ("2025-02-01", "2025-05-31")}
 
 
-def run_variant(o: pd.DataFrame, ma50: pd.Series, a14: pd.Series, *, exit_above=RULE.exit, exit_below=RULE.exit,
+def run_variant(o: pd.DataFrame, ma50: pd.Series, a14: pd.Series, *, exit_above=OLD.exit, exit_below=OLD.exit,
                 block_hv=RULE.block_highvol, block_oh=RULE.block_overheat, trail=None,
                 need_below_ma50=False) -> pd.Series:
     """checklist_score 의 run_rule 을 넓힌 상태 기계 (보유 1 / 대기 0)."""
@@ -116,12 +132,14 @@ def main() -> None:
 
     tk, ev, years, blocks, vrows = [], [], [], [], []
     port: dict[str, list[pd.Series]] = {v: [] for v in VARIANTS} | {"보유": []}
+    fam, wrows, quality = [], [], {w: [] for w in WEIGHT_SETS}
+    wport: dict[str, list[pd.Series]] = {}
     for row in wl.itertuples(index=False):
         t = row.ticker
         df = prices(t)
         bench = prices(row.bench)["Close"] if row.bench else None
         p = get_profile(t)
-        o = checklist_score(df, p, bench)
+        o = checklist_score(df, p, bench, OLD)
         x = compute_indicators(df, p, bench)
         a14 = atr(df, 14)
         first = o["score_s"].first_valid_index()
@@ -194,6 +212,29 @@ def main() -> None:
                 vrows.append({"v": vn, "t": t, "p": pn, "cagr": ps["cagr"], "mdd": ps["mdd"], "sharpe": ps["sharpe"],
                               "bh_cagr": pb["cagr"], "bh_mdd": pb["mdd"], "bh_sharpe": pb["sharpe"],
                               "expo": pos.mean(), "tpy": (pos.diff() > 0).sum() / (len(seg) / 252)})
+        # 7. 배점: 성향별 정보량, 배점 후보 × (이전 퇴출 / A), 점수 품질
+        fmin = c[::-1].rolling(60, min_periods=20).min()[::-1].shift(-1) / c - 1
+        fvol = np.log(c).diff().rolling(20).std().shift(-20) * np.sqrt(252)
+        f60 = c.shift(-60) / c - 1
+        fam.append(pd.DataFrame({"t": t, "fmin": fmin, "fvol": fvol, "f60": f60,
+                                 **{f: o.get(f"f_{f}", pd.Series(np.nan, index=idx)) for f in FAM}}))
+        for wn, w in WEIGHT_SETS.items():
+            ow = checklist_score(df, p, bench, replace(OLD, weights=tuple(w.items()))).loc[first:]
+            sc = ow["score_s"]
+            cross = ((sc >= RULE.entry) != (sc.shift(1) >= RULE.entry)) & sc.notna() & sc.shift(1).notna()
+            quality[wn].append(pd.DataFrame({"t": t, "s": sc, "fmin": fmin, "fvol": fvol, "f60": f60,
+                                             "cross": cross.astype(float)}))
+            for rn, kw in (("이전 퇴출", {}), ("A", dict(exit_above=None))):
+                st = run_variant(ow, x["ma_mid"], a14, **kw)
+                rr = state_returns(c, st)
+                wport.setdefault(f"{wn} + {rn}", []).append(rr.rename(t))
+                for pn, a, b in periods:
+                    seg = rr.loc[a:b]
+                    if len(seg) < 200:
+                        continue
+                    ps, pos = perf_stats(seg), st.loc[a:b].fillna(0.0)
+                    wrows.append({"w": wn, "r": rn, "t": t, "p": pn, "sharpe": ps["sharpe"],
+                                  "tpy": (pos.diff() > 0).sum() / (len(seg) / 252)})
         print(f"{t} 완료", file=sys.stderr)
 
     lines: list[str] = []
@@ -301,6 +342,58 @@ def main() -> None:
     table(pd.DataFrame(rows))
     rows = [{"규칙": vn, **{name: pct(mdd(r.loc[a:b])) for name, (a, b) in CRISES.items()}} for vn, r in ew.items()]
     out("### 위기 구간 최대 낙폭 (동일가중 포트폴리오)\n")
+    table(pd.DataFrame(rows))
+
+    out("## 7. 배점\n")
+    F = pd.concat(fam)
+    tr = F[F.index <= periods[0][2]]
+    rows = []
+    for f in FAM:
+        g = tr.groupby(f)[["fvol", "fmin", "f60"]].mean()
+        if 1.0 not in g.index or -1.0 not in g.index:
+            continue
+        flips = np.median([(d[f].dropna().diff().abs() > 0).sum() / (d[f].notna().sum() / 252)
+                           for _, d in tr.groupby("t") if d[f].notna().sum() > 252])
+        rows.append({"성향": f, "이후 변동성 🟢": pct(g.loc[1, "fvol"]), "🔴": pct(g.loc[-1, "fvol"]),
+                     "이후 60일 최저 🟢": pct(g.loc[1, "fmin"]), "🔴 ": pct(g.loc[-1, "fmin"]),
+                     "60일 수익 🟢−🔴": pct(g.loc[1, "f60"] - g.loc[-1, "f60"]), "색 바뀜/년": f"{flips:.0f}"})
+    out(f"### 성향별 정보량 ({periods[0][0]}, 전 종목 합산)\n")
+    table(pd.DataFrame(rows))
+    d = tr.dropna(subset=["fmin"]).copy()
+    for f in FAM:
+        d[f] = d[f].astype(float).fillna(0.0)
+    y = (d["fmin"] - d.groupby("t")["fmin"].transform("mean")).astype(float).to_numpy()
+    beta = np.linalg.lstsq(np.c_[np.ones(len(d)), d[FAM].to_numpy(float)], y, rcond=None)[0][1:]
+    out("이후 60일 최저(종목 평균 제거)를 성향 색으로 회귀한 계수 — 클수록 🟢일 때 하락이 얕음: "
+        + ", ".join(f"{f} {b:+.4f}" for f, b in zip(FAM, beta)) + "\n")
+    out("### 배점 × 퇴출 방식 (동일가중 포트폴리오: 수익 · 최대낙폭 · 샤프 / 종목 중앙값 매매/년)\n")
+    W7 = pd.DataFrame(wrows)
+    rows = []
+    for key, lst in wport.items():
+        r = pd.concat(lst, axis=1).mean(axis=1, skipna=True)
+        wn, rn = key.rsplit(" + ", 1)
+        rec = {"배점": wn, "퇴출": rn}
+        for pn, a, b in periods:
+            ps = perf_stats(r.loc[a:b])
+            sub = W7[(W7.w == wn) & (W7.r == rn) & (W7.p == pn)]
+            rec[pn] = f"{pct(ps['cagr'])} · {pct(ps['mdd'])} · {ps['sharpe']:.2f} / {sub.tpy.median():.1f}"
+        for name in ("2008 금융위기", "2020 코로나", "2025 관세 충격"):
+            a, b = CRISES[name]
+            rec[name] = pct(mdd(r.loc[a:b]))
+        rows.append(rec)
+    table(pd.DataFrame(rows))
+    out("### 점수 자체의 품질 (3일 평균, 매매 규칙과 무관)\n")
+    rows = []
+    for wn, lst in quality.items():
+        Q = pd.concat(lst)
+        for pn, a, b in periods:
+            q = Q[(Q.index >= a) & (Q.index <= b)].dropna(subset=["s"])
+            hi, lo = q[q.s >= RULE.entry], q[q.s <= RULE.exit]
+            ic = q.dropna(subset=["fmin"]).groupby("t").apply(lambda z: z.s.rank().corr(z.fmin.rank())).median()
+            yrs = (q.index.max() - q.index.min()).days / 365.25
+            rows.append({"배점": wn, "기간": pn, "이후 변동성 ≥70 / ≤40": f"{pct(hi.fvol.mean())} / {pct(lo.fvol.mean())}",
+                         "이후 60일 최저 ≥70 / ≤40": f"{pct(hi.fmin.mean())} / {pct(lo.fmin.mean())}",
+                         "점수-하락 순위상관": f"{ic:.3f}", "70선 교차/년": f"{q.groupby('t').cross.sum().median() / yrs:.1f}"})
     table(pd.DataFrame(rows))
 
     if args.md:

@@ -36,7 +36,8 @@ COST = 0.0005
 TECH = ("SPY", "QQQ", "SOXX", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA")
 CRISES = {"2008": ("2007-10-01", "2009-03-31"), "2020": ("2020-02-01", "2020-04-30"),
           "2022": ("2022-01-01", "2022-10-31"), "2025 관세": ("2025-02-01", "2025-05-31")}
-FREQ = {"매주": 5, "매월": 21, "월말": 0}  # 0 = 매월 마지막 거래일 종가에 교체 (메일의 '이번 달 바구니')
+FREQ = {"매주": 5, "2주": 10, "매월": 21, "월말": 0, "월2회": -1}
+# 0 = 매월 마지막 거래일 종가, -1 = 매월 15일(휴장이면 직전 거래일)과 마지막 거래일 종가 (메일의 바구니)
 NS, KS, SEEDS = (50, 60, 70, 80), (3, 5, 8, 10), 30
 
 
@@ -49,6 +50,8 @@ class Book:
         self.r = C.pct_change().fillna(0.0).to_numpy()
         self.h = H.fillna(0.0).to_numpy() == 1
         self.month_end = np.r_[self.dates[1:].month != self.dates[:-1].month, True]
+        nxt = np.r_[self.dates[1:].day, 99]
+        self.semi = self.month_end | ((self.dates.day <= 15) & ((nxt > 15) | self.month_end))
 
     def target(self, d: int, n: float, k: int, rule: bool, rng=None) -> np.ndarray:
         s = self.s[d]
@@ -81,7 +84,7 @@ class Book:
             out[d] = (w * self.r[d]).sum()
             grown = w * (1 + self.r[d])
             w = grown / (1 + out[d]) if 1 + out[d] > 0 else grown
-            if (self.month_end[d] if every == 0 else d % every == 0):
+            if (self.month_end[d] if every == 0 else self.semi[d] if every == -1 else d % every == 0):
                 nw = self.target(d, n, k, rule, rng)
                 tc = np.abs(nw - w).sum()
                 turn += tc

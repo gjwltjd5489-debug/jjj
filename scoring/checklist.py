@@ -16,7 +16,7 @@ import pandas as pd
 from .profiles import Profile
 from .checklist_score import RULE, checklist_score, points_from_verdicts
 from .indicators import rolling_pct_rank
-from .topk import BASKET_K, BASKET_N, basket_weights, month_end, next_month_end, prev_month_end
+from .topk import BASKET_K, BASKET_N, basket_weights, next_rebalance, prev_rebalance, rebalance_days
 from .score import compute_indicators
 
 UP, DOWN, WARN, NEUTRAL = "✅", "❌", "⚠️", "➖"
@@ -368,7 +368,7 @@ def trade_signal(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None) -
             "event": last["event"], "blocked": last["blocked"], "stop": float(last["stop"]),
             "close": float(last["close"]), "above200": bool(last["above200"]), "ma200": float(last["ma200"]),
             "overheat": bool(last["overheat"]), "highvol": bool(last["highvol"]), "recent": recent,
-            "hist": o[["score_s", "state", "close"]].iloc[-70:].copy()}  # 바구니 계산용 (지난 월말들)
+            "hist": o[["score_s", "state", "close"]].iloc[-70:].copy()}  # 바구니 계산용 (지난 교체일들)
 
 
 def _entry_risks(g: dict) -> list[str]:
@@ -444,10 +444,11 @@ def holdings(reports: list[TickerReport]) -> list[TickerReport]:
     return sorted((r for r in reports if r.sig and r.sig["held"]), key=lambda r: -r.sig["score_s"])
 
 
-# ---------------------------------------------------------------- 이번 달 바구니 (docs/topk.md)
+# ---------------------------------------------------------------- 바구니 (docs/topk.md)
 
 BASKET_RULE = (f"규칙상 보유 종목 중 3일 평균 {BASKET_N:g}점 이상 상위 {BASKET_K}개를 {100 / BASKET_K:g}%씩, "
-               "매월 마지막 거래일 종가 기준으로 교체 (빈자리는 현금, 달 중간에는 규칙 매도 신호가 나도 월말까지 보유)")
+               "매월 15일(휴장이면 직전 거래일)·마지막 거래일 종가 기준으로 교체 "
+               "(빈자리는 현금, 교체 사이에는 규칙 매도 신호가 나도 다음 교체일까지 보유)")
 
 
 def _state_at(reports: list[TickerReport], d) -> tuple[dict, dict]:
@@ -484,13 +485,13 @@ def _ret(c1: dict, c0: dict, t: str) -> float:
 
 
 def basket_state(reports: list[TickerReport]) -> dict | None:
-    """이번 달 바구니와 직전 바구니 대비 변화. 오늘 종가가 이달 마지막 거래일이면 '오늘 교체'."""
+    """현재 바구니와 직전 바구니 대비 변화. 오늘 종가가 교체일(15일·월말)이면 '오늘 교체'."""
     if not any(r.sig and r.sig.get("hist") is not None for r in reports):
         return None
     today = max(r.date for r in reports).date()
-    rebalance = today == month_end(today)
-    base = today if rebalance else prev_month_end(today)
-    prev = prev_month_end(base)
+    rebalance = today in rebalance_days(today)
+    base = today if rebalance else prev_rebalance(today)
+    prev = prev_rebalance(base)
     sc, hd = _state_at(reports, base)
     sc0, hd0 = _state_at(reports, prev)
     if not sc:
@@ -502,7 +503,7 @@ def basket_state(reports: list[TickerReport]) -> dict | None:
         why = ("규칙상 매도" if not hd.get(t) else f"점수 {sc[t]:.0f} < {BASKET_N:g}" if sc.get(t, 0) < BASKET_N
                else f"순위 밖 (점수 {sc[t]:.0f})")
         out.append((t, why))
-    # 수익률: 평소에는 이번 달(지난 월말 종가 → 오늘), 교체일에는 방금 끝난 달(지난 바구니 기준)
+    # 수익률: 평소에는 이번 기간(지난 교체일 종가 → 오늘), 교체일에는 방금 끝난 기간(지난 바구니 기준)
     c_now, c_base, c_prev = _close_at(reports), _close_at(reports, base), _close_at(reports, prev)
     rows = [{"ticker": t, "weight": w[t], "score": sc[t], "now": now.get(t, {}).get("score_s", float("nan")),
              "new": t not in w0, "held_now": bool(now.get(t, {}).get("held", True)),
@@ -515,7 +516,7 @@ def basket_state(reports: list[TickerReport]) -> dict | None:
     else:
         month_ret = sum(x["weight"] * x["ret"] for x in rows if pd.notna(x["ret"]))
     return {"today": today, "rebalance": rebalance, "base": base, "prev": prev,
-            "next": next_month_end(today) if rebalance else month_end(today), "rows": rows, "out": out,
+            "next": next_rebalance(today), "rows": rows, "out": out,
             "cash": max(0.0, 1.0 - sum(w.values())), "month_ret": month_ret,
             "name": {r.ticker: r.name for r in reports}}
 
@@ -525,8 +526,8 @@ def _md(d) -> str:
 
 
 def _ret_label(b: dict) -> str:
-    return (f"지난달 바구니 수익률 ({_md(b['prev'])} → {_md(b['base'])} 종가)" if b["rebalance"]
-            else f"이번 달 수익률 ({_md(b['base'])} 종가 → {_md(b['today'])} 종가)")
+    return (f"지난 바구니 수익률 ({_md(b['prev'])} → {_md(b['base'])} 종가)" if b["rebalance"]
+            else f"이번 기간 수익률 ({_md(b['base'])} 종가 → {_md(b['today'])} 종가)")
 
 
 def _pct_html(x: float) -> str:
@@ -545,12 +546,12 @@ def _basket_lines(b: dict) -> list[str]:
     lines = [head]
     for x in b["rows"]:
         tag = " (신규)" if x["new"] and b["rebalance"] else ""
-        warn = " · ⚠️ 달 중간 규칙 매도 신호 (월말까지 보유)" if not b["rebalance"] and not x["held_now"] else ""
-        ret = "" if pd.isna(x["ret"]) else (f" · 지난달 {x['ret']:+.1%}" if b["rebalance"] else f" · 이번 달 {x['ret']:+.1%}")
+        warn = " · ⚠️ 교체 사이 규칙 매도 신호 (다음 교체일까지 보유)" if not b["rebalance"] and not x["held_now"] else ""
+        ret = "" if pd.isna(x["ret"]) else (f" · 지난 기간 {x['ret']:+.1%}" if b["rebalance"] else f" · 이번 기간 {x['ret']:+.1%}")
         lines.append(f"{x['ticker']} {x['weight'] * 100:.1f}% · 점수 {x['score']:.0f}"
                      + ("" if b["rebalance"] else f" → 오늘 {x['now']:.0f}") + ret + tag + warn)
     if b["rebalance"]:
-        lines += [f"제외 {t}: {why}" + ("" if pd.isna(r) else f" · 지난달 {r:+.1%}") for t, why, r in b["out"]]
+        lines += [f"제외 {t}: {why}" + ("" if pd.isna(r) else f" · 지난 기간 {r:+.1%}") for t, why, r in b["out"]]
     lines.append(f"현금 {b['cash'] * 100:.0f}%")
     lines.append(f"{_ret_label(b)}: {b['month_ret']:+.1%} (배당 포함, 현금 수익 0으로 계산)")
     return lines
@@ -558,7 +559,7 @@ def _basket_lines(b: dict) -> list[str]:
 
 def _basket_html(b: dict) -> str:
     e = html.escape
-    parts = [f"<h3>🧺 이번 달 바구니 <span class='m' style='font-weight:normal;font-size:12px'>{e(BASKET_RULE)}</span></h3>"]
+    parts = [f"<h3>🧺 바구니 <span class='m' style='font-weight:normal;font-size:12px'>{e(BASKET_RULE)}</span></h3>"]
     new = [x["ticker"] for x in b["rows"] if x["new"]]
     if b["rebalance"]:
         parts.append(f"<div class='box sig'><b>오늘({_md(b['base'])}) 종가 기준 교체</b> — 다음 거래일에 아래 비중으로 맞추세요 · "
@@ -569,14 +570,14 @@ def _basket_html(b: dict) -> str:
     parts.append(f"<p style='margin:2px 0 4px;font-size:13px'>{e(_ret_label(b))}: <b>{_pct_html(b['month_ret'])}</b></p>")
     parts.append("<table class='tb'><tr><th class='s'>종목</th><th class='s'>비중</th>"
                  f"<th class='s'>점수<br>{_md(b['base'])}</th>" + ("" if b["rebalance"] else "<th class='s'>점수<br>오늘</th>")
-                 + "<th class='s'>비고<br>" + ("지난달 수익률" if b["rebalance"] else "이번 달 수익률") + "</th></tr>")
+                 + "<th class='s'>비고<br>" + ("지난 기간 수익률" if b["rebalance"] else "이번 기간 수익률") + "</th></tr>")
     for x in b["rows"]:
         if b["rebalance"]:
-            note = "🆕 신규" if x["new"] else f"지난달 {_pct_html(x['ret'])}"
+            note = "🆕 신규" if x["new"] else f"지난 기간 {_pct_html(x['ret'])}"
         else:
             note = f"<b>{_pct_html(x['ret'])}</b>"
             if not x["held_now"]:
-                note += "<br><span class='wr'>⚠️ 규칙 매도 신호<br>월말까지 보유</span>"
+                note += "<br><span class='wr'>⚠️ 규칙 매도 신호<br>다음 교체일까지 보유</span>"
         parts.append(f"<tr><td class='l' style='font-size:13px'><b>{e(x['ticker'])}</b><br><span class='m nm'>"
                      f"{e(b['name'].get(x['ticker'], ''))}</span></td><td class='c'><b>{x['weight'] * 100:.1f}%</b></td>"
                      f"<td class='c'>{_sc_badge(x['score'])}</td>"
@@ -586,7 +587,7 @@ def _basket_html(b: dict) -> str:
         for t, why, r in b["out"]:
             parts.append(f"<tr><td class='l' style='font-size:13px;color:#999'><s>{e(t)}</s></td><td class='c m'>0%</td>"
                          f"<td class='c m' colspan='2' style='font-size:12px'>제외 · {e(why)}"
-                         + ("" if pd.isna(r) else f"<br>지난달 {_pct_html(r)}") + "</td></tr>")
+                         + ("" if pd.isna(r) else f"<br>지난 기간 {_pct_html(r)}") + "</td></tr>")
     parts.append(f"<tr><td class='l m' style='font-size:13px'>현금</td><td class='c'><b>{b['cash'] * 100:.0f}%</b></td>"
                  f"<td colspan='{2 if b['rebalance'] else 3}'></td></tr></table>")
     return "".join(parts)
@@ -924,7 +925,7 @@ def _sections(reports: list[TickerReport], meta: dict) -> list[tuple[str, list[s
                          [_holding_text(r) for r in hs]))
         b = basket_state(reports)
         if b:
-            secs.append((f"이번 달 바구니 (규칙 보유 중 {BASKET_N:g}점 이상 상위 {BASKET_K}개 · {100 / BASKET_K:g}%씩 · 월말 교체)",
+            secs.append((f"바구니 (규칙 보유 중 {BASKET_N:g}점 이상 상위 {BASKET_K}개 · {100 / BASKET_K:g}%씩 · 15일·월말 교체)",
                          _basket_lines(b)))
     look = market_lines(reports, meta) + _headline(reports)
     if meta.get("calendar_note"):

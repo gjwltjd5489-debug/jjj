@@ -642,7 +642,7 @@ def _signal_html(reports: list[TickerReport]) -> str:
             rows.append(f"<li><b>{e(t)}</b></li>")
         else:
             cls, label = _SIG_LABEL[k]
-            rows.append(f"<li><span class='b b{cls}'>{label}</span> <b>{e(r.ticker)}</b> "
+            rows.append(f"<li><span class='b {cls}'>{label}</span> <b>{e(r.ticker)}</b> "
                         f"<span class='m'>{e(r.name)}</span> — {e(t)}</li>")
     parts = ["<div class='box sig'><b>오늘의 매수·매도 신호</b><ul>" + "".join(rows) + "</ul>"]
     hs = holdings(reports)

@@ -94,7 +94,7 @@ def test_data_issues_jump_volume_and_stale():
 def test_subjects_and_plain_text():
     r = build_with_history(smooth(0.002), P, "UP")
     normal = {"mode": "normal", "failed": []}
-    assert make_subject([r], normal).startswith("[미장 체크리스트]")
+    assert make_subject([r], normal).startswith("[미장] ") and len(make_subject([r], normal)) <= 90
     hol = {"mode": "holiday", "failed": [], "checked": "2026-11-26", "holiday": "추수감사절",
            "next_open": "2026-11-27", "target": "2026-11-25"}
     assert make_subject([r], hol).startswith("[휴장]")
@@ -166,3 +166,76 @@ def test_trade_signal_on_real_like_series():
     assert r.sig is not None and r.sig["stop"] < r.sig["close"]
     assert abs(r.sig["score"] - r.score) < 1e-9  # 신호 점수 = 메일 표 색으로 센 점수
     assert "매수·매도 신호" in render_html([r], {"mode": "normal", "failed": []})
+
+
+# ---------------------------------------------------------------- 메일 개편 (색 변화만, 임박 신호, 보유 표, 기록)
+
+def _rep(ticker="X", **sig):
+    from scoring.checklist import TickerReport
+    d = {"score": 50.0, "score_s": 50.0, "prev_score_s": 50.0, "proj": 50.0, "held": False, "event": "", "blocked": "",
+         "stop": 95.0, "close": 100.0, "above200": True, "overheat": False, "highvol": False, "recent": []}
+    d.update(sig)
+    return TickerReport(ticker=ticker, name="", group="", date=pd.Timestamp("2026-09-29"), close=100.0, change=0.0,
+                        from_high=0.0, checks=[], sig=d)
+
+
+def test_near_signals_use_tomorrow_projection():
+    from scoring.checklist import make_subject, signal_groups
+    reps = [_rep("NB", score=83, score_s=64, proj=72),                       # 내일 진입 가능
+            _rep("NR", score=83, score_s=64, proj=72, above200=False),       # 가능하지만 200일선 아래
+            _rep("NE", score=33, score_s=55, proj=39, held=True),            # 내일 퇴출 가능
+            _rep("H", score=83, score_s=80, proj=81, held=True)]
+    g = signal_groups(reps)
+    assert [r.ticker for r, _ in g["near_buy"]] == ["NB", "NR"] and "진입 보류" in g["near_buy"][1][1]
+    assert [r.ticker for r, _ in g["near_exit"]] == ["NE"] and "매도 신호" in g["near_exit"][0][1]
+    assert [r.ticker for r, _ in g["hold"]] == ["H"]
+    subj = make_subject(reps, {"mode": "normal", "failed": []})
+    assert subj.startswith("[미장] 9/29 · 매수 없음 · 매도 없음") and "NB↑" in subj and "NE↓" in subj
+
+
+def test_holdings_table_shows_stop_and_room():
+    from scoring.checklist import holdings, render_html, render_text
+    reps = [_rep("A", score_s=75, held=True, stop=96.0), _rep("B", score_s=90, held=True, event="BUY"), _rep("C")]
+    assert [r.ticker for r in holdings(reps)] == ["B", "A"]
+    text = render_text(reps, {"mode": "normal", "failed": []})
+    assert "A 75 · 종가 100.00 · 손절 참고 96.00 (-4.0%) · 퇴출선까지 35점" in text
+
+
+def test_color_only_changes_and_no_hover_text():
+    from scoring.checklist import Check, _verdict_changes, change_lines, render_html
+    r = build_with_history(smooth(0.002), P, "UP")
+    adx = r.check("ADX")
+    prev = [Check(c.group, c.name, c.status, c.detail, c.tag, c.short, c.na) for c in r.checks]
+    # 같은 🟠 안의 변화(횡보→약함)는 변화로 세지 않는다
+    r.checks = [c if c.name != "ADX" else Check(c.group, c.name, "➖", "22 추세 약함", "약함", "ADX 22") for c in r.checks]
+    r.prev_checks = [c if c.name != "ADX" else Check(c.group, c.name, "➖", "15 횡보", "횡보", "ADX 15") for c in prev]
+    assert _verdict_changes(r) == []
+    # 색이 바뀌면(🟠→🟢) 바뀐 항목의 현재 수치와 함께 보인다
+    r.checks = [c if c.name != "ADX" else Check(c.group, c.name, UP, "30 강한 상승추세", "", "ADX 30") for c in r.checks]
+    assert [g for g, _, _ in _verdict_changes(r)] == ["추세 강도"]
+    summary, lines = change_lines([r])
+    assert summary.startswith("색이 바뀐 성향 1건") and "(ADX 30)" in lines[0]
+    page = render_html([r], {"mode": "normal", "failed": []})
+    assert "마우스" not in page and "docs/checklist_score.md" in page and "상세" not in page
+    assert adx is not None
+
+
+def test_recent_signal_log_and_summary():
+    from scoring.checklist import recent_signals, recent_summary
+    reps = [_rep("A", recent=[{"date": pd.Timestamp("2026-09-10"), "event": "BUY", "close": 90.0, "ret": 0.1}]),
+            _rep("B", recent=[{"date": pd.Timestamp("2026-09-20"), "event": "SELL", "close": 110.0, "ret": -0.05}])]
+    items = recent_signals(reps)
+    assert [r.ticker for r, _ in items] == ["B", "A"]  # 최신순
+    s = recent_summary(items)
+    assert "매수 1건: 신호 뒤 평균 +10.0% (오른 것 1건)" in s and "매도 1건: 신호 뒤 평균 -5.0% (매도 뒤 더 내린 것 1건)" in s
+
+
+def test_market_lines_fx_and_calendar():
+    from scoring.checklist import market_lines
+    r = build_with_history(smooth(0.002), P, "UP")
+    meta = {"fx": {"rate": 1355.5, "d1": -0.003, "m1": 0.012},
+            "upcoming": [("10/14(수)", "CPI 발표 (9월분) 08:30 ET")]}
+    lines = market_lines([r], meta)
+    assert lines[0].startswith("1종목 중 200일선 위 1")
+    assert "원/달러 1,355.5원 (전일 대비 -0.3% · 1개월 +1.2%)" in lines
+    assert lines[-1] == "다가오는 일정 (2주): 10/14(수) CPI 발표 (9월분) 08:30 ET"

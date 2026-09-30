@@ -68,3 +68,12 @@ def test_strategy_returns_next_day():
     out = pd.DataFrame({"close": [100, 110, 121, 121.0], "state": [1, 1, 0, 0.0]}, index=idx)
     r = strategy_returns(out, cost=0.0)
     assert r.tolist() == pytest.approx([0, 0.10, 0.10, 0])
+
+
+def test_projection_is_tomorrow_average_if_score_repeats():
+    from scoring.checklist_score import checklist_score
+    from tests.test_checklist import smooth
+    o = checklist_score(smooth(0.002, n=700), get_profile("QQQ")).dropna(subset=["score_s"])
+    s = o["score"]
+    expect = (s.shift(1) + 2 * s) / 3
+    assert np.allclose(o["proj"].iloc[5:], expect.iloc[5:])

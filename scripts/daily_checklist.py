@@ -3,6 +3,8 @@
 - 직전 거래일과 비교해 바뀐 항목을 강조한다.
 - 데이터를 점검한다: 기준일 지연, 급변, 거래량 누락, 계산 안 된 지표.
 - NYSE 휴장일에는 휴장 안내 형식으로 바꾼다.
+- 마지막으로 끝난 정규장까지만 쓴다 (장중에 실행해도 진행 중인 오늘 막대를 종가로 쓰지 않음).
+- 원/달러 환율과 다가오는 일정(FOMC·CPI·실적 발표)을 붙인다.
 - 메일 제목·본문 파일까지 만들어서, 루틴은 파일만 읽어 보내면 된다.
 
 예)
@@ -28,8 +30,9 @@ sys.path.insert(0, str(ROOT))
 from scoring import get_profile  # noqa: E402
 from scoring.checklist import (build_with_history, make_subject, render_html, render_markdown,  # noqa: E402
                                render_text)
+from scoring.extras import calendar_note, earnings_dates, fmt_day, fx_summary, upcoming  # noqa: E402
 from scoring.market_calendar import session_status  # noqa: E402
-from scoring.sources import load_prices  # noqa: E402
+from scoring.sources import fetch_fdr, load_prices  # noqa: E402
 
 
 def main() -> None:
@@ -42,6 +45,7 @@ def main() -> None:
     ap.add_argument("--out-dir", help="checklist.md/html, subject.txt, body.txt, meta.json 저장 폴더")
     ap.add_argument("--out-md", help="마크다운 저장 경로")
     ap.add_argument("--out-html", help="HTML 저장 경로")
+    ap.add_argument("--no-extras", action="store_true", help="환율·실적 일정 조회 생략 (오프라인 테스트용)")
     args = ap.parse_args()
 
     now = datetime.fromisoformat(args.now) if args.now else None
@@ -55,7 +59,9 @@ def main() -> None:
         wl["bench"] = ""
     start = (pd.Timestamp.today() - pd.DateOffset(years=args.years)).strftime("%Y-%m-%d")
 
-    cut = pd.Timestamp(status["target"]) if now else None  # --now 로 과거 시점을 흉내 낼 때는 그 시점까지만
+    # 마지막으로 끝난 정규장까지만: 장중에 실행하면 진행 중인 오늘 막대가 종가처럼 쓰이는 것을 막는다.
+    # (--now 로 과거 시점을 흉내 낼 때도 그 시점까지만)
+    cut = pd.Timestamp(status["target"])
     benches: dict[str, pd.Series | None] = {}
 
     def bench_for(sym: str, ticker: str) -> pd.Series | None:
@@ -91,6 +97,20 @@ def main() -> None:
     else:
         mode = "normal"
     meta = {"mode": mode, "failed": failed, **{k: str(v) if v else v for k, v in status.items()}}
+    ev_from = status["next_open"]  # 일정은 다음 거래일부터
+    if not args.no_extras:
+        try:
+            fx = fetch_fdr("USD/KRW", start)["Close"]  # 환율은 배당 조정 없이 종가 그대로
+            fx.index = pd.to_datetime(fx.index)
+            meta["fx"] = fx_summary(fx.loc[: pd.Timestamp(status["checked"]) + pd.Timedelta(days=1)] if now else fx)
+        except Exception as e:
+            meta["fx"] = None
+            print(f"환율 불러오기 실패: {type(e).__name__}", file=sys.stderr)
+        earn = earnings_dates(list(wl["ticker"]), ev_from)
+    else:
+        earn = {}
+    meta["upcoming"] = [(fmt_day(d), label) for d, label in upcoming(ev_from, 14, earn)]
+    meta["calendar_note"] = calendar_note(ev_from)
 
     md = render_markdown(reports, meta)
     subject = make_subject(reports, meta)

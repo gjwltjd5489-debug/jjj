@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 
 from scoring import get_profile
-from scoring.intraday import IntradayRow, check_ticker, classify, make_subject, provisional_frame, render_html
+from scoring.intraday import (IntradayRow, check_ticker, classify, make_subject, provisional_frame, render_html,
+                              render_text, table_rows)
 from tests.test_checklist import smooth
 
 P = get_profile("QQQ")
@@ -66,3 +67,28 @@ def test_subject_and_modes():
     hol = {"mode": "holiday", "date": "2026-11-26", "time": "10:03", "minutes": 33, "holiday": "추수감사절"}
     assert make_subject([], hol).startswith("[장초반 확인] 휴장") and "휴장일" in render_html([], hol)
     assert not np.isnan(r.move)
+
+
+def test_near_entry_and_exit_lines():
+    assert row(dict(BASE, state=0.0, score_s=58.0), dict(BASE, state=0.0, score_s=66.0)) == {"near_buy"}
+    assert row(dict(BASE, state=0.0, score_s=58.0), dict(BASE, state=0.0, score_s=60.0)) == set()   # 한 칸 밖
+    assert row(dict(BASE, state=0.0, blocked="과열"), dict(BASE, state=0.0, score_s=66.0)) == set()  # 아침 보류는 반복 안 함
+    assert row(dict(BASE, score_s=55.0), dict(BASE, score_s=45.0)) == {"near_sell"}
+
+
+def test_table_keeps_alerts_and_holdings_and_summarises_rest():
+    def mk(t, m, p, price=100.0):
+        r = IntradayRow(t, "", "", True, 100.0, 100.0, price, 0.0, price / 100 - 1, 0.01, m, p)
+        r.notes = classify(r)
+        return r
+    quiet = dict(BASE, state=0.0, score_s=20.0)
+    rows = [mk("Q", quiet, quiet), mk("H", dict(BASE), dict(BASE)),
+            mk("S", dict(BASE), dict(BASE), price=95.5), mk("M", quiet, dict(quiet, score_s=30.0))]
+    show, rest = table_rows(rows)
+    assert [r.ticker for r in show] == ["S", "H", "M"] and [r.ticker for r in rest] == ["Q"]
+    meta = {"mode": "normal", "date": "2026-09-30", "time": "10:03", "minutes": 33,
+            "today_events": [("9/30(수)", "FOMC 금리 결정 14:00 ET")]}
+    text = render_text(rows, meta)
+    assert "해당 없음: 아침 신호 재확인" in text and "나머지 1종목" in text and "FOMC" in text
+    calm = render_html([mk("Q", quiet, quiet)], meta)
+    assert "특이사항 없음" in calm

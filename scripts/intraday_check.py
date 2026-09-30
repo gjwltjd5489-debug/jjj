@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
+from scoring.extras import earnings_dates, fmt_day, upcoming  # noqa: E402
 from scoring.intraday import check_ticker, make_subject, render_html, render_text  # noqa: E402
 from scoring.market_calendar import NY, holiday_name, is_trading_day  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
@@ -33,6 +34,7 @@ def main() -> None:
     ap.add_argument("--years", type=int, default=3)
     ap.add_argument("--now", help="기준 시각 (ISO, 시간대 포함) — 테스트용")
     ap.add_argument("--out-dir", default=str(ROOT / "out" / "intraday"))
+    ap.add_argument("--no-extras", action="store_true", help="실적 일정 조회 생략 (오프라인 테스트용)")
     args = ap.parse_args()
 
     now = (datetime.fromisoformat(args.now) if args.now else datetime.now(tz=NY)).astimezone(NY)
@@ -67,6 +69,9 @@ def main() -> None:
                 failed.append(f"{r.ticker} ({type(ex).__name__})")
         meta["failed"] = failed
         meta["mode"] = "normal" if any(r.has_intraday for r in rows) else "no_data"
+        # 오늘·내일 일정 (FOMC·CPI·실적 발표): 장중 매매 전 확인용
+        earn = {} if args.no_extras else earnings_dates(list(wl["ticker"]), today)
+        meta["today_events"] = [(fmt_day(d), label) for d, label in upcoming(today, 1, earn)]
 
     subject = make_subject(rows, meta)
     body = render_text(rows, meta)

@@ -156,13 +156,15 @@ def checklist_score(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None
         required.append("상대강도")
     score = score_from_verdicts(fv, required)
     score_s = score.rolling(rule.smooth).mean() if rule.smooth > 1 else score
+    # 오늘 점수가 내일도 그대로일 때의 내일 평균 (신호 임박 판단용)
+    proj = score_s + (score - score.shift(rule.smooth - 1)) / rule.smooth if rule.smooth > 1 else score
     above200 = (x["close"] > x["ma_long"]).to_numpy()
     disp_pct = rolling_pct_rank(x["close"] / x["ma_mid"] - 1, p.pct_window)
     overheat = (disp_pct >= 0.95).to_numpy()
     highvol = (x["rvol_pct"] >= 0.8).to_numpy()
     state, events, blocked = run_rule(score_s.to_numpy(), above200, overheat, highvol, rule)
     out = pd.DataFrame({
-        "close": x["close"], "score": score, "score_s": score_s,
+        "close": x["close"], "score": score, "score_s": score_s, "proj": proj,
         "above200": above200, "overheat": overheat, "highvol": highvol,
         "state": state, "event": events, "blocked": blocked,
         "stop": x["close"] - rule.stop_atr * atr(df, 14),

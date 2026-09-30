@@ -13,6 +13,7 @@ QQQ 기준으로 시작했고, 종목별 프로파일로 확장할 수 있다. *
 | [docs/data_sources.md](docs/data_sources.md) | 주가 데이터를 바로 받을 수 있는 사이트 검토 |
 | [docs/checklist_review.md](docs/checklist_review.md) | 일일 체크리스트 적정성 검토와 v2 (성향별 판정) |
 | [docs/checklist_score.md](docs/checklist_score.md) | 체크리스트 점수(성향 색으로 계산)와 매수·매도 규칙, 27종목 검증 |
+| [docs/mails.md](docs/mails.md) | 아침 체크리스트·장초반 확인 메일 구성, 일정 파일 관리 |
 
 ## 설치
 ```bash

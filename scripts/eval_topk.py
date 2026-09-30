@@ -36,7 +36,7 @@ COST = 0.0005
 TECH = ("SPY", "QQQ", "SOXX", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA")
 CRISES = {"2008": ("2007-10-01", "2009-03-31"), "2020": ("2020-02-01", "2020-04-30"),
           "2022": ("2022-01-01", "2022-10-31"), "2025 관세": ("2025-02-01", "2025-05-31")}
-FREQ = {"매주": 5, "매월": 21}
+FREQ = {"매주": 5, "매월": 21, "월말": 0}  # 0 = 매월 마지막 거래일 종가에 교체 (메일의 '이번 달 바구니')
 NS, KS, SEEDS = (50, 60, 70, 80), (3, 5, 8, 10), 30
 
 
@@ -48,6 +48,7 @@ class Book:
         self.s = S.to_numpy()
         self.r = C.pct_change().fillna(0.0).to_numpy()
         self.h = H.fillna(0.0).to_numpy() == 1
+        self.month_end = np.r_[self.dates[1:].month != self.dates[:-1].month, True]
 
     def target(self, d: int, n: float, k: int, rule: bool, rng=None) -> np.ndarray:
         s = self.s[d]
@@ -80,7 +81,7 @@ class Book:
             out[d] = (w * self.r[d]).sum()
             grown = w * (1 + self.r[d])
             w = grown / (1 + out[d]) if 1 + out[d] > 0 else grown
-            if d % every == 0:
+            if (self.month_end[d] if every == 0 else d % every == 0):
                 nw = self.target(d, n, k, rule, rng)
                 tc = np.abs(nw - w).sum()
                 turn += tc
@@ -107,6 +108,7 @@ def main() -> None:
     ap.add_argument("--md", help="결과 마크다운 저장")
     ap.add_argument("--ns", type=float, nargs="+", default=list(NS), help="점수 기준 n 목록")
     ap.add_argument("--ks", type=int, nargs="+", default=list(KS), help="보유 종목 수 k 목록")
+    ap.add_argument("--freqs", nargs="+", default=["매주", "매월"], choices=list(FREQ), help="리밸런싱 주기")
     args = ap.parse_args()
 
     end = pd.Timestamp(args.asof)
@@ -168,7 +170,8 @@ def main() -> None:
         out(f"## {'3' if rule else '2'}. {title}\n")
         out("무작위 = 같은 후보 중 무작위 k개를 30번 뽑았을 때, 점수순이 그보다 샤프가 높았던 비율 (괄호: 무작위 샤프 중앙값)\n")
         rows = []
-        for fn, every in FREQ.items():
+        for fn in args.freqs:
+            every = FREQ[fn]
             for n in args.ns:
                 for k in args.ks:
                     r, turn, info = book.run(n, k, every, rule)

@@ -100,3 +100,22 @@ def test_basket_state_between_and_on_rebalance_day():
     assert t04r["since"] == date(2026, 8, 14)
     text = render_text(reps, meta)
     assert "제외 T00: 점수 50 < 60 · 보유 기간 +0.0% (~8/14~9/30)" in text and "T05 20.0% · 점수 99 (신규)" in text
+
+
+def test_basket_ytd_compounds_with_costs():
+    from scoring.checklist import TickerReport, basket_ytd, render_text
+    idx = pd.bdate_range("2025-12-01", "2026-09-29")
+    reps = []
+    for i, t in enumerate(["T00", "T01", "T02", "T03", "T04", "SPY"]):
+        close = np.where(idx >= "2026-03-02", 110.0, 100.0) if t in ("T00", "SPY") else np.full(len(idx), 100.0)
+        hist = pd.DataFrame({"score_s": 90.0 - i if t != "SPY" else 30.0, "state": 1.0, "close": close}, index=idx)
+        sig = {"score": 90.0, "score_s": 90.0 - i, "prev_score_s": 90.0, "proj": 90.0, "held": True, "event": "",
+               "blocked": "", "stop": 95.0, "close": close[-1], "above200": True, "ma200": 90.0, "overheat": False,
+               "highvol": False, "recent": [], "hist": hist}
+        reps.append(TickerReport(ticker=t, name="", group="", date=idx[-1], close=close[-1], change=0.0,
+                                 from_high=0.0, checks=[], sig=sig))
+    y = basket_ytd(reps, date(2026, 9, 29))
+    # 5종목 20%씩 계속 보유, T00 만 +10% → 약 +2%. 처음 매수 비용 0.05%와 교체 때 비중 되돌리는 비용이 조금 빠진다
+    assert y["start"] == date(2025, 12, 31) and y["trades"] == 18
+    assert 0.0185 < y["ret"] < 0.0195 and abs(y["bench_ret"] - 0.10) < 1e-12
+    assert "올해 누적 수익률 (12/31 → 9/29 종가, 교체 18회): +1.9% · 같은 기간 SPY +10.0%" in render_text(reps, {"mode": "normal", "failed": []})

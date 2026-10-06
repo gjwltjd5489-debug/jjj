@@ -77,14 +77,15 @@ class Book:
     def run(self, n: float, k: int, every: int, rule: bool = False, rng=None, mid_exit: bool = False,
             rf: np.ndarray | None = None, exclude: np.ndarray | None = None, equity: np.ndarray | None = None,
             dist: np.ndarray | None = None, rq: np.ndarray | None = None,
-            offset: int = 0) -> tuple[pd.Series, float, dict]:
+            offset: int = 0, record: bool = False) -> tuple[pd.Series, float, dict]:
         """mid_exit: 교체 사이에 규칙 매도(보유 상태 0)가 나면 그날 종가에 팔아 현금 · rf: 현금 일간 수익률 (날짜 순).
 
         메일의 바구니 운용 (scoring/topk.py, scoring/checklist.py _simulate 와 같은 계산):
         exclude: 후보에서 뺄 열 · dist: SPY 가 200일선보다 아래인 비율 (+면 아래, NaN = 200일선 없음) →
         equity 열은 아래일 때 비중 절반 (교체일, 그리고 교체 사이 처음 내려간 날 한 번) ·
         rq: QLD 일간 수익률 → 하락 매수 (dist 5%마다 5%, 최대 50%, −25% 손절, 200일선 회복 시 청산).
-        offset: 교체일을 이만큼 거래일 뒤로 민다 (교체일 운 확인용, 월2회만)."""
+        offset: 교체일을 이만큼 거래일 뒤로 민다 (교체일 운 확인용, 월2회만).
+        record: self.rec 에 날마다 (거래 전 비중, 거래 뒤 비중, QLD 전, QLD 뒤, 교체일) — next_open_returns 용."""
         N = len(self.cols)
         w = np.zeros(N)
         out = np.zeros(len(self.dates))
@@ -99,6 +100,7 @@ class Book:
         blocked = cut_done = False
         order: list[int] = []
         self.events = []
+        self.rec = []
 
         def trim(wv: np.ndarray, need: float) -> float:
             got = 0.0
@@ -118,6 +120,7 @@ class Book:
             grown = w * (1 + self.r[d])
             w = grown / (1 + out[d]) if 1 + out[d] > 0 else grown
             q, qb = q * (1 + r_q) / (1 + out[d]), qb / (1 + out[d])
+            w_pre, q_pre = w.copy(), q
             reb = self.month_end[d] if every == 0 else semi[d] if every == -1 else d % every == 0
             if not reb and dist is not None and ro and not ro_prev and not cut_done:
                 c = w * eq * (1 - RISK_OFF_CUT)
@@ -147,43 +150,80 @@ class Book:
                     cnt.append((nw > 0).sum())
                     cash.append(1 - nw.sum())
                     tech.append(nw[ti].sum())
-            if rq is None or np.isnan(x):
-                continue
-            if blocked and x <= 0:
-                blocked = False
-            if cq > 0:
-                stop = q < (1 + DIP_STOP) * qb
-                if stop or x <= 0:
-                    turn += q
-                    out[d] -= q * COST
-                    self.events.append((d, "dip_stop" if stop else "dip_exit", q))
-                    q = cq = qb = 0.0
-                    blocked = bool(stop and x > 0)
-                    if not reb:   # 판 돈으로 지금 바구니 종목을 목표 비중까지
-                        for i in order:
-                            if w[i] <= 0:
-                                continue
-                            add = min(max(0.0, (RISK_OFF_CUT if ro and eq[i] else 1.0) / k - w[i]), 1 - w.sum())
-                            if add > 0:
-                                w[i] += add
-                                turn += add
-                                out[d] -= add * COST
-                    continue
-            if x > 0 and not blocked:
-                tgt = dip_target(x)
-                if tgt > cq + 1e-12:
-                    amt = tgt - cq
-                    room = 1 - w.sum() - q
-                    if amt > room + 1e-12:
-                        got = trim(w, amt - room)
-                        turn += got
-                        out[d] -= got * COST
-                    turn += amt
-                    out[d] -= amt * COST
-                    q, qb, cq = q + amt, qb + amt, tgt
-                    self.events.append((d, "dip_buy", amt))
+            if rq is not None and not np.isnan(x):
+                if blocked and x <= 0:
+                    blocked = False
+                exited = False
+                if cq > 0:
+                    stop = q < (1 + DIP_STOP) * qb
+                    if stop or x <= 0:
+                        turn += q
+                        out[d] -= q * COST
+                        self.events.append((d, "dip_stop" if stop else "dip_exit", q))
+                        q = cq = qb = 0.0
+                        blocked = bool(stop and x > 0)
+                        exited = True
+                        if not reb:   # 판 돈으로 지금 바구니 종목을 목표 비중까지
+                            for i in order:
+                                if w[i] <= 0:
+                                    continue
+                                add = min(max(0.0, (RISK_OFF_CUT if ro and eq[i] else 1.0) / k - w[i]), 1 - w.sum())
+                                if add > 0:
+                                    w[i] += add
+                                    turn += add
+                                    out[d] -= add * COST
+                if not exited and x > 0 and not blocked:
+                    tgt = dip_target(x)
+                    if tgt > cq + 1e-12:
+                        amt = tgt - cq
+                        room = 1 - w.sum() - q
+                        if amt > room + 1e-12:
+                            got = trim(w, amt - room)
+                            turn += got
+                            out[d] -= got * COST
+                        turn += amt
+                        out[d] -= amt * COST
+                        q, qb, cq = q + amt, qb + amt, tgt
+                        self.events.append((d, "dip_buy", amt))
+            if record:
+                self.rec.append((w_pre, w.copy(), q_pre, q, bool(reb)))
         info = {"종목 수": np.mean(cnt), "현금": np.mean(cash), "기술주": np.mean(tech)}
         return pd.Series(out, index=self.dates), turn / (len(self.dates) / 252), info
+
+
+def next_open_returns(rec: list, g1: np.ndarray, g2: np.ndarray, qg1: np.ndarray, qg2: np.ndarray,
+                      rf: np.ndarray | None = None) -> np.ndarray:
+    """Book.run(record=True) 기록을 '신호는 그날 종가로 보고, 체결은 다음 날 시가'로 다시 계산한 일간 수익.
+
+    g1·g2: 날짜 × 종목 밤사이(전일 종가 → 시가)·장중(시가 → 종가) 배수, qg1·qg2: QLD 의 같은 값.
+    교체일 주문은 다음 날 시가에 목표 비중으로 맞추고, 그 밖의 주문(규칙 매도·필터 절반 매도·QLD 매수·
+    청산 뒤 채우기)은 줄인 비율·늘린 양만큼 다음 날 시가에 옮긴다. 비용은 시가에 바뀐 비중 × COST."""
+    n = g1.shape[1]
+    a, aq = np.zeros(n), 0.0
+    out = np.zeros(len(rec))
+    pend = None
+    for d in range(len(rec)):
+        h1 = np.where(a > 0, g1[d], 1.0)
+        tot1 = (a * h1).sum() + aq * qg1[d] + (1 - a.sum() - aq)
+        a, aq = a * h1 / tot1, aq * qg1[d] / tot1
+        cost = 0.0
+        if pend is not None:
+            wpre, wpost, qpre, qpost, reb = pend
+            if reb:
+                na, nq = wpost.copy(), qpost
+            else:
+                ratio = np.divide(wpost, wpre, out=np.zeros(n), where=wpre > 0)
+                na = np.where(wpost <= wpre + 1e-15, a * ratio, a + (wpost - wpre))
+                nq = (aq * qpost / qpre if qpre > 0 else 0.0) if qpost <= qpre else aq + (qpost - qpre)
+            cost = (np.abs(na - a).sum() + abs(nq - aq)) * COST
+            a, aq = na, nq
+        tot2 = (a * g2[d]).sum() + aq * qg2[d] + (1 - a.sum() - aq) * (1 + (rf[d] if rf is not None else 0.0))
+        a, aq = a * g2[d] / tot2, aq * qg2[d] / tot2
+        out[d] = tot1 * tot2 * (1 - cost) - 1
+        wpre, wpost, qpre, qpost, reb = rec[d]
+        changed = reb or np.abs(wpost - wpre).sum() > 1e-12 or abs(qpost - qpre) > 1e-12
+        pend = rec[d] if changed else None
+    return out
 
 
 def mdd(r: pd.Series) -> float:

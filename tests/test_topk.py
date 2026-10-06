@@ -259,6 +259,12 @@ def test_mail_overlay_matches_backtest(drop, last):
                          equity=np.array([group[c] == "지수" for c in cols]), dist=dist, rq=rq)
     assert [k for _, k, _ in book.events] == [k for _, k, _ in sim["events"] if k.startswith("dip")]
     assert abs(sim["value"] - float((1 + out).prod())) < 1e-12
+    # 다음 날 시가 체결: 시가가 전일 종가와 같으면(밤사이 0) 종가 체결과 거의 같아야 한다
+    book.run(60, 5, -1, True, mid_exit=True, rf=rfa, exclude=np.array([c == "IWM" for c in cols]),
+             equity=np.array([group[c] == "지수" for c in cols]), dist=dist, rq=rq, record=True)
+    g2 = 1 + C.pct_change().fillna(0.0).to_numpy()
+    ro = et.next_open_returns(book.rec, np.ones_like(g2), g2, np.ones(len(idx)), 1 + rq, rfa)
+    assert abs(float(np.prod(1 + ro)) / float((1 + out).prod()) - 1) < 1e-3
 
 
 def test_mail_shows_filter_and_qld():

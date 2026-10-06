@@ -30,7 +30,7 @@ from scoring import get_profile  # noqa: E402
 from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.checklist_score import checklist_score, strategy_returns  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
-from scoring.topk import MOM_DAYS  # noqa: E402
+from scoring.topk import DIP_STOP, MOM_DAYS, RISK_OFF_CUT, dip_target  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
 
 BACKFILL = {"PDBC": "PDBC+DBC"}
@@ -56,39 +56,75 @@ class Book:
         nxt = np.r_[self.dates[1:].day, 99]
         self.semi = self.month_end | ((self.dates.day <= 15) & ((nxt > 15) | self.month_end))
 
-    def target(self, d: int, n: float, k: int, rule: bool, rng=None) -> np.ndarray:
+    def target(self, d: int, n: float, k: int, rule: bool, rng=None, exclude=None, ranked: bool = False):
+        """교체일 목표 비중. exclude: 후보에서 뺄 열(bool 배열). ranked=True 면 (비중, 순위 순 열 번호)."""
         s = self.s[d]
         elig = ~np.isnan(s) & (s >= n)
         if rule:
             elig &= self.h[d]
+        if exclude is not None:
+            elig &= ~exclude
         w = np.zeros(len(s))
-        m = elig.sum()
-        if m == 0:
-            return w
-        if m <= k:
-            w[elig] = 1.0 / k
-            return w
-        if rng is not None:
-            w[rng.choice(np.flatnonzero(elig), k, replace=False)] = 1.0 / k
-            return w
-        # 점수 → 최근 MOM_DAYS 거래일 수익률 → 열 이름 순 (메일의 basket_weights 와 같음)
-        mom = np.where(np.isnan(self.mom[d]), -np.inf, self.mom[d])
-        order = sorted(np.flatnonzero(elig), key=lambda i: (-s[i], -mom[i], self.cols[i]))
-        w[order[:k]] = 1.0 / k
-        return w
+        if rng is not None and elig.sum() > k:
+            pick = list(rng.choice(np.flatnonzero(elig), k, replace=False))
+        else:
+            # 점수 → 최근 MOM_DAYS 거래일 수익률 → 열 이름 순 (메일의 basket_weights 와 같음)
+            mom = np.where(np.isnan(self.mom[d]), -np.inf, self.mom[d])
+            pick = sorted(np.flatnonzero(elig), key=lambda i: (-s[i], -mom[i], self.cols[i]))[:k]
+        w[pick] = 1.0 / k
+        return (w, pick) if ranked else w
 
     def run(self, n: float, k: int, every: int, rule: bool = False, rng=None, mid_exit: bool = False,
-            rf: np.ndarray | None = None) -> tuple[pd.Series, float, dict]:
-        """mid_exit: 교체 사이에 규칙 매도(보유 상태 0)가 나면 그날 종가에 팔아 현금 · rf: 현금 일간 수익률 (날짜 순)."""
-        w = np.zeros(len(self.cols))
+            rf: np.ndarray | None = None, exclude: np.ndarray | None = None, equity: np.ndarray | None = None,
+            dist: np.ndarray | None = None, rq: np.ndarray | None = None,
+            offset: int = 0) -> tuple[pd.Series, float, dict]:
+        """mid_exit: 교체 사이에 규칙 매도(보유 상태 0)가 나면 그날 종가에 팔아 현금 · rf: 현금 일간 수익률 (날짜 순).
+
+        메일의 바구니 운용 (scoring/topk.py, scoring/checklist.py _simulate 와 같은 계산):
+        exclude: 후보에서 뺄 열 · dist: SPY 가 200일선보다 아래인 비율 (+면 아래, NaN = 200일선 없음) →
+        equity 열은 아래일 때 비중 절반 (교체일, 그리고 교체 사이 처음 내려간 날 한 번) ·
+        rq: QLD 일간 수익률 → 하락 매수 (dist 5%마다 5%, 최대 50%, −25% 손절, 200일선 회복 시 청산).
+        offset: 교체일을 이만큼 거래일 뒤로 민다 (교체일 운 확인용, 월2회만)."""
+        N = len(self.cols)
+        w = np.zeros(N)
         out = np.zeros(len(self.dates))
         turn, cnt, cash, tech = 0.0, [], [], []
         ti = [i for i, c in enumerate(self.cols) if c in TECH]
+        semi = self.semi
+        if offset:
+            semi = np.zeros(len(self.dates), bool)
+            semi[np.minimum(np.flatnonzero(self.semi) + offset, len(self.dates) - 1)] = True
+        eq = equity if equity is not None else np.zeros(N, bool)
+        q = cq = qb = 0.0
+        blocked = cut_done = False
+        order: list[int] = []
+        self.events = []
+
+        def trim(wv: np.ndarray, need: float) -> float:
+            got = 0.0
+            for i in reversed(order):
+                if got >= need - 1e-12:
+                    break
+                x = min(wv[i], need - got)
+                wv[i] -= x
+                got += x
+            return got
         for d in range(len(self.dates)):
-            out[d] = (w * self.r[d]).sum() + ((1 - w.sum()) * rf[d] if rf is not None else 0.0)
+            x = dist[d] if dist is not None else np.nan
+            ro = x > 0
+            ro_prev = d > 0 and dist is not None and dist[d - 1] > 0
+            r_q = rq[d] if rq is not None else 0.0
+            out[d] = (w * self.r[d]).sum() + q * r_q + ((1 - w.sum() - q) * rf[d] if rf is not None else 0.0)
             grown = w * (1 + self.r[d])
             w = grown / (1 + out[d]) if 1 + out[d] > 0 else grown
-            reb = self.month_end[d] if every == 0 else self.semi[d] if every == -1 else d % every == 0
+            q, qb = q * (1 + r_q) / (1 + out[d]), qb / (1 + out[d])
+            reb = self.month_end[d] if every == 0 else semi[d] if every == -1 else d % every == 0
+            if not reb and dist is not None and ro and not ro_prev and not cut_done:
+                c = w * eq * (1 - RISK_OFF_CUT)
+                turn += c.sum()
+                out[d] -= c.sum() * COST
+                w = w - c
+                cut_done = True
             if mid_exit and not reb:
                 sell = (w > 0) & ~self.h[d]
                 if sell.any():
@@ -96,7 +132,13 @@ class Book:
                     out[d] -= w[sell].sum() * COST
                     w[sell] = 0.0
             if reb:
-                nw = self.target(d, n, k, rule, rng)
+                cut_done = False
+                nw, order = self.target(d, n, k, rule, rng, exclude, ranked=True)
+                if ro:
+                    nw = np.where(eq, nw * RISK_OFF_CUT, nw)
+                over = nw.sum() + q - 1
+                if over > 1e-12:
+                    trim(nw, over)
                 tc = np.abs(nw - w).sum()
                 turn += tc
                 out[d] -= tc * COST
@@ -105,6 +147,41 @@ class Book:
                     cnt.append((nw > 0).sum())
                     cash.append(1 - nw.sum())
                     tech.append(nw[ti].sum())
+            if rq is None or np.isnan(x):
+                continue
+            if blocked and x <= 0:
+                blocked = False
+            if cq > 0:
+                stop = q < (1 + DIP_STOP) * qb
+                if stop or x <= 0:
+                    turn += q
+                    out[d] -= q * COST
+                    self.events.append((d, "dip_stop" if stop else "dip_exit", q))
+                    q = cq = qb = 0.0
+                    blocked = bool(stop and x > 0)
+                    if not reb:   # 판 돈으로 지금 바구니 종목을 목표 비중까지
+                        for i in order:
+                            if w[i] <= 0:
+                                continue
+                            add = min(max(0.0, (RISK_OFF_CUT if ro and eq[i] else 1.0) / k - w[i]), 1 - w.sum())
+                            if add > 0:
+                                w[i] += add
+                                turn += add
+                                out[d] -= add * COST
+                    continue
+            if x > 0 and not blocked:
+                tgt = dip_target(x)
+                if tgt > cq + 1e-12:
+                    amt = tgt - cq
+                    room = 1 - w.sum() - q
+                    if amt > room + 1e-12:
+                        got = trim(w, amt - room)
+                        turn += got
+                        out[d] -= got * COST
+                    turn += amt
+                    out[d] -= amt * COST
+                    q, qb, cq = q + amt, qb + amt, tgt
+                    self.events.append((d, "dip_buy", amt))
         info = {"종목 수": np.mean(cnt), "현금": np.mean(cash), "기술주": np.mean(tech)}
         return pd.Series(out, index=self.dates), turn / (len(self.dates) / 252), info
 

@@ -4,9 +4,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from scoring.topk import (basket_weights, mid_month, month_end, next_month_end, next_rebalance, prev_month_end,
-                         prev_rebalance)
+from scoring.topk import (basket_weights, dip_target, mid_month, month_end, next_month_end, next_rebalance,
+                         prev_month_end, prev_rebalance, trim_bottom)
 
 
 def test_basket_weights_top_k_ties_and_cash():
@@ -21,6 +22,16 @@ def test_basket_weights_top_k_ties_and_cash():
     assert len(w) == 5 and "SOXX" in w and "NVDA" not in w and all(v == 0.2 for v in w.values())
     w = basket_weights(sc, held, n=60, k=10)             # 후보 4개 → 10%씩, 현금 60%
     assert set(w) == {"A", "B", "C", "D"} and abs(sum(w.values()) - 0.4) < 1e-12
+    # 중복 제거: IWM·VTV·SCHD 는 점수가 높아도 후보에서 빠진다
+    w = basket_weights({**sc, "IWM": 100.0, "VTV": 99.0}, {**held, "IWM": True, "VTV": True}, n=60, k=2)
+    assert w == {"A": 0.5, "B": 0.5}
+
+
+def test_dip_ladder_and_trim():
+    # SPY 200일선 대비 −4.9% → 0, −5% → 5%, −12% → 10%, −80% → 최대 50%
+    assert [dip_target(x) for x in (0.0, 0.049, 0.05, 0.12, 0.8, float("nan"))] == [0.0, 0.0, 0.05, 0.10, 0.5, 0.0]
+    w = {"A": 0.2, "B": 0.2, "C": 0.1}                     # 순위 순 → 하위(C)부터 줄인다
+    assert trim_bottom(w, 0.15) == pytest.approx(0.15) and w == {"A": 0.2, "B": pytest.approx(0.15)}
 
 
 def test_month_end_calendar():
@@ -195,3 +206,95 @@ def test_sold_then_rebought_restarts_entry():
     t0 = next(x for x in b["rows"] if x["ticker"] == "T00")
     assert b["rebalance"] and t0["since"] == date(2026, 9, 30) and abs(t0["ret_hold"]) < 1e-12
     assert abs(t0["ret"]) < 1e-12          # 지난 기간: 9/16 종가(100)에 팔아 손실 없음
+
+
+def _overlay_case(drop: float = 0.992):
+    """SPY 가 2~3월에 매일 drop 배씩 빠졌다가 4월부터 회복하는 가짜 시장 (QLD = SPY 2배).
+    0.992 → 200일선 −24% 까지 (QLD 손절), 0.997 → −10% 남짓 (회복 때 청산)."""
+    from scoring.market_calendar import is_trading_day
+    days = pd.DatetimeIndex([d for d in pd.bdate_range("2025-01-02", "2026-09-30") if is_trading_day(d.date())])
+    t = np.arange(len(days))
+    path = np.where(days < "2026-02-02", 1 + 0.0004 * t, np.nan)
+    i0 = int(np.flatnonzero(days >= "2026-02-02")[0])
+    lvl = path[i0 - 1]
+    for i in range(i0, len(days)):           # 2~3월 하락 → 4월 이후 회복
+        lvl *= drop if days[i] < pd.Timestamp("2026-04-01") else 1.006
+        path[i] = lvl
+    spy = pd.Series(100 * path, index=days)
+    qld = pd.Series(100 * np.cumprod(1 + 2 * spy.pct_change().fillna(0.0)), index=days)
+    return days, spy, qld
+
+
+@pytest.mark.parametrize("drop, last", [(0.992, "dip_stop"), (0.997, "dip_exit")])
+def test_mail_overlay_matches_backtest(drop, last):
+    """SPY 200일선 필터·QLD 하락 매수까지 메일 계산(_simulate)과 검증 엔진(Book.run)이 같은 값을 내는지."""
+    from scoring.checklist import TickerReport, _simulate
+    spec = importlib.util.spec_from_file_location("eval_topk", Path(__file__).parents[1] / "scripts" / "eval_topk.py")
+    et = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(et)
+    days, spy, qld = _overlay_case(drop)
+    idx = days[days >= "2026-01-15"]
+    rng = np.random.default_rng(5)
+    cols = [f"T{i:02d}" for i in range(9)] + ["IWM"]
+    C = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0.0, 0.015, (len(idx), 10)), axis=0)), index=idx, columns=cols)
+    S = pd.DataFrame(rng.choice([62.5, 75, 83.3, 91.7, 100.0], size=(len(idx), 10)), index=idx, columns=cols)
+    S["IWM"] = 100.0                                     # 점수 1등이어도 바구니 후보에서 빠진다
+    H = pd.DataFrame((rng.random((len(idx), 10)) > 0.05).astype(float), index=idx, columns=cols)
+    group = {c: ("지수" if i % 2 == 0 else "원자재·통화") for i, c in enumerate(cols)}
+    rf = pd.Series(0.04 / 252, index=idx)
+    reps = [TickerReport(ticker=c, name="", group=group[c], date=idx[-1], close=float(C[c].iloc[-1]), change=0.0,
+                         from_high=0.0, checks=[], sig={"hist": pd.DataFrame({"score_s": S[c], "state": H[c], "close": C[c]})})
+            for c in cols]
+    ov = {"spy": spy, "qld": qld, "group": group}
+    sim = _simulate(reps, idx[0].date(), idx[-1].date(), rf, ov=ov)
+    dips = [k for _, k, _ in sim["events"] if k.startswith("dip")]
+    assert dips[0] == "dip_buy" and dips[-1] == last and "IWM" not in sim["w"]
+    rfa = rf.to_numpy().copy()
+    rfa[0] = 0.0
+    ma = spy.rolling(200).mean()
+    dist = (1 - spy / ma).reindex(idx).to_numpy()
+    rq = qld.pct_change().reindex(idx).fillna(0.0).to_numpy()
+    book = et.Book(S, C, H)
+    out, _, _ = book.run(60, 5, -1, True, mid_exit=True, rf=rfa, exclude=np.array([c == "IWM" for c in cols]),
+                         equity=np.array([group[c] == "지수" for c in cols]), dist=dist, rq=rq)
+    assert [k for _, k, _ in book.events] == [k for _, k, _ in sim["events"] if k.startswith("dip")]
+    assert abs(sim["value"] - float((1 + out).prod())) < 1e-12
+
+
+def test_mail_shows_filter_and_qld():
+    """SPY 200일선 아래: 주식 종목 절반 표시, QLD 매수 신호가 제목·본문에 나오고 회복하면 청산."""
+    from scoring.checklist import TickerReport, basket_state, make_subject, render_html, render_text
+    days, spy, qld = _overlay_case(0.997)
+    group = {"T00": "지수", "T01": "빅테크", "T02": "원자재·통화", "T03": "채권·부동산", "T04": "대체", "VTV": "섹터·스타일"}
+
+    def reps(last: str):
+        idx = days[days <= last]
+        out = []
+        for i, t in enumerate(group):
+            hist = pd.DataFrame({"score_s": 95.0 - i, "state": 1.0, "close": 100.0}, index=idx)
+            sig = {"score": 90.0, "score_s": 95.0 - i, "prev_score_s": 90.0, "proj": 90.0, "held": True, "event": "",
+                   "blocked": "", "stop": 95.0, "close": 100.0, "above200": True, "ma200": 90.0, "overheat": False,
+                   "highvol": False, "recent": [], "hist": hist}
+            out.append(TickerReport(ticker=t, name="", group=group[t], date=idx[-1], close=100.0, change=0.0,
+                                    from_high=0.0, checks=[], sig=sig))
+        return out
+    ov = {"spy": spy, "qld": qld, "group": group}
+    meta = {"mode": "normal", "failed": [], "overlay": ov}
+    dist = 1 - spy / spy.rolling(200).mean()
+    first_buy = dist.index[dist >= 0.05][0].date()            # SPY 가 200일선보다 5% 아래로 처음 내려간 날
+    b = basket_state(reps(str(first_buy)), ov=ov)
+    assert ("dip_buy", (0.05, pytest.approx(float(dist.loc[str(first_buy)])))) in b["ov"]["today"]
+    assert "QLD +5%" in make_subject(reps(str(first_buy)), meta)
+    text = render_text(reps(str(first_buy)), meta)
+    assert "🟢 QLD 5% 매수 신호" in text and "주식 종목은 절반(10%)" in text
+    assert "VTV" not in [x["ticker"] for x in b["rows"]]       # 중복 제거
+    # 그다음 교체일: 주식 종목(T00·T01)은 10%, 나머지는 20%, QLD 몫은 현금에서
+    nxt = next_rebalance(first_buy)
+    b2 = basket_state(reps(str(nxt)), ov=ov)
+    w = {x["ticker"]: x["weight"] for x in b2["rows"]}
+    assert w["T00"] == pytest.approx(0.1) and w["T01"] == pytest.approx(0.1) and w["T02"] == pytest.approx(0.2)
+    assert b2["ov"]["q_base"] > 0 and "½ 필터" in render_html(reps(str(nxt)), meta)
+    # 200일선 회복 날: QLD 청산 신호
+    back = dist.index[(dist.index > pd.Timestamp(nxt)) & (dist <= 0)][0].date()
+    assert "QLD 청산" in make_subject(reps(str(back)), meta)
+    assert basket_state(reps(str(back)), ov=ov)["ov"]["q_now"] == 0.0

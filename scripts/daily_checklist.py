@@ -34,6 +34,7 @@ from scoring.bigtech import BENCH, compute_members, load_members, load_watchlist
 from scoring.bigtech import GROUP as BIGTECH  # noqa: E402
 from scoring.extras import calendar_note, earnings_dates, fmt_day, fx_summary, tbill_daily, upcoming  # noqa: E402
 from scoring.market_calendar import session_status  # noqa: E402
+from scoring.topk import DIP_TICKER  # noqa: E402
 from scoring.sources import fetch_fdr, load_prices  # noqa: E402
 
 
@@ -126,6 +127,14 @@ def main() -> None:
     meta = {"mode": mode, "failed": failed, "notes": notes, **{k: str(v) if v else v for k, v in status.items()}}
     meta["basket_extra"] = basket_extra
     meta["rf"] = None if args.no_extras else tbill_daily(start)
+    # SPY 200일선 필터·QLD 하락 매수 (scoring/topk.py). QLD 가격을 못 받으면 메일에 그렇게 적고 필터만 쓴다
+    try:
+        qld = load_prices(args.source.format(t=DIP_TICKER), start)["Close"].loc[:cut]
+    except Exception:
+        qld = None
+    spy = bench_for("SPY", "")
+    meta["overlay"] = None if spy is None else {"spy": spy, "qld": qld,
+                                                "group": {r.ticker: r.group for r in reports + basket_extra}}
     ev_from = status["next_open"]  # 일정은 다음 거래일부터
     if not args.no_extras:
         try:
@@ -153,7 +162,7 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
         (d / "subject.txt").write_text(subject + "\n", encoding="utf-8")
         (d / "body.txt").write_text(render_text(reports, meta) + "\n", encoding="utf-8")
-        plain = {k: v for k, v in meta.items() if k not in ("basket_extra", "rf")}
+        plain = {k: v for k, v in meta.items() if k not in ("basket_extra", "rf", "overlay")}
         (d / "meta.json").write_text(json.dumps({**plain, "latest": str(latest), "subject": subject},
                                                 ensure_ascii=False, indent=2), encoding="utf-8")
     if args.out_md:

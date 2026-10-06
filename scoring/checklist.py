@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass, field
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -17,8 +18,9 @@ from .profiles import Profile
 from .checklist_score import RULE, checklist_score, points_from_verdicts
 from .indicators import rolling_pct_rank
 from .bigtech import eligible
-from .topk import (BASKET_K, BASKET_N, MOM_DAYS, basket_weights, month_end, next_rebalance, prev_rebalance,
-                   rebalance_days)
+from .topk import (BASKET_EXCLUDE, BASKET_K, BASKET_N, DIP_CAP, DIP_SIZE, DIP_STEP, DIP_STOP, DIP_TICKER,
+                   EQUITY_GROUPS, MOM_DAYS, RISK_OFF_CUT, basket_weights, dip_target, month_end, next_rebalance,
+                   prev_rebalance, rebalance_days, trim_bottom)
 from .score import compute_indicators
 
 UP, DOWN, WARN, NEUTRAL = "✅", "❌", "⚠️", "➖"
@@ -342,7 +344,7 @@ def trade_signal(df: pd.DataFrame, p: Profile, bench: pd.Series | None = None) -
             "event": last["event"], "blocked": last["blocked"], "stop": float(last["stop"]),
             "close": float(last["close"]), "above200": bool(last["above200"]), "ma200": float(last["ma200"]),
             "overheat": bool(last["overheat"]), "highvol": bool(last["highvol"]), "recent": recent,
-            "hist": o[["score_s", "state", "close"]].iloc[-300:].copy()}  # 바구니 계산용 (지난 교체일들, 약 1년)
+            "hist": o[["score_s", "state", "close"]].iloc[-500:].copy()}  # 바구니 계산용 (지난 교체일들, 약 2년)
 
 
 def _entry_risks(g: dict) -> list[str]:
@@ -421,8 +423,12 @@ def holdings(reports: list[TickerReport]) -> list[TickerReport]:
 # ---------------------------------------------------------------- 바구니 (docs/topk.md)
 
 BASKET_RULE = (f"규칙상 보유 종목 중 3일 평균 {BASKET_N:g}점 이상 상위 {BASKET_K}개를 {100 / BASKET_K:g}%씩, "
-               "매월 15일(휴장이면 직전 거래일)·마지막 거래일 종가 기준으로 교체 (점수가 같으면 최근 60거래일 수익률 순). "
-               "교체 사이에 규칙 매도 신호가 나면 바로 팔아 현금으로 두고, 빈자리와 현금은 단기국채 금리를 받는다고 계산")
+               "매월 15일(휴장이면 직전 거래일)·마지막 거래일 종가 기준으로 교체 (점수가 같으면 최근 60거래일 수익률 순, "
+               f"{'·'.join(BASKET_EXCLUDE)}는 다른 주식 종목과 겹쳐 제외). 교체 사이에 규칙 매도 신호가 나면 바로 팔아 현금. "
+               f"SPY가 200일선 아래면 주식 종목은 절반({100 / BASKET_K * RISK_OFF_CUT:g}%). "
+               f"SPY가 200일선보다 {DIP_STEP:.0%} 아래면 {DIP_TICKER} {DIP_SIZE:.0%}, {DIP_STEP:.0%} 더 내려갈 때마다 "
+               f"{DIP_SIZE:.0%}씩 (최대 {DIP_CAP:.0%}, 현금부터 쓰고 모자라면 하위 종목부터 줄임) · 200일선 회복 시 전량 매도 · "
+               f"{DIP_TICKER} 묶음 {DIP_STOP:.0%}면 손절. 현금은 단기국채 금리를 받는다고 계산")
 
 
 def _state_at(reports: list[TickerReport], d) -> tuple[dict, dict]:
@@ -503,44 +509,183 @@ def _rf_on(rf: pd.Series | None, d: pd.Timestamp) -> float:
 BASKET_COST = 0.0005  # 바뀐 비중에 매기는 편도 비용 (검증과 같음)
 
 
+def _overlay_series(ov: dict | None, idx: pd.DatetimeIndex) -> tuple[pd.Series | None, pd.Series | None]:
+    """(SPY 가 200일선보다 아래인 비율 — +면 아래, 200일선이 없으면 NaN · QLD 일간 수익률). idx 날짜에 맞춘다."""
+    if not ov or ov.get("spy") is None or not len(ov["spy"]):
+        return None, None
+    spy = ov["spy"].dropna()
+    ma = spy.rolling(200).mean()
+    dist = (1 - spy / ma).reindex(idx, method="ffill", limit=5)
+    q = ov.get("qld")
+    rq = None
+    if q is not None and len(q):
+        q = q.dropna()
+        rq = (q.reindex(idx.union(q.index)).ffill().reindex(idx).pct_change()).fillna(0.0)
+    return dist, rq
+
+
+def _new_state() -> dict:
+    """바구니 운용 상태. w: 종목 → 비중(순위 순) · q: QLD 비중 · cq: 사다리로 산 누적 비율 ·
+    qbasis: QLD 산 금액(지금 평가액 대비) · t0: 첫 매수일 · blocked: 손절 뒤 매수 중지 · cut: 이번 기간 필터 매도 여부"""
+    return {"w": {}, "q": 0.0, "cq": 0.0, "qbasis": 0.0, "t0": None, "blocked": False, "cut": False}
+
+
+def _copy_state(st: dict) -> dict:
+    return {**st, "w": dict(st["w"])}
+
+
 def _simulate(reports: list[TickerReport], start, end, rf: pd.Series | None = None, buy_cost: bool = True,
-              trade_at_end: bool = True) -> dict:
+              trade_at_end: bool = True, ov: dict | None = None, state: dict | None = None,
+              record: bool = False) -> dict:
     """start 교체일 종가에 바구니를 짜고 end 종가까지 규칙대로 운용 (scripts/eval_topk.py 의 Book 과 같은 계산).
 
-    교체일마다 basket_weights 로 바꾸고, 교체 사이에 규칙 매도 신호(보유 상태 0)가 나면 그날 종가에 팔아 현금.
-    현금은 rf(일간)를 받는다. 비용: 바뀐 비중 × BASKET_COST (buy_cost=False 면 처음 사는 비용은 뺌,
-    trade_at_end=False 면 end 가 교체일이어도 그날 교체는 하지 않음 — 방금 끝난 기간 성과용).
-    반환: value(끝 가치, 시작 1), trades(교체 횟수, 시작 포함), sells[(종목, 날짜)], w(끝 비중)"""
+    - 교체일마다 basket_weights 로 바꾸고, 교체 사이에 규칙 매도 신호(보유 상태 0)가 나면 그날 종가에 팔아 현금.
+    - ov(SPY·QLD 종가, 종목 → 그룹)가 있으면 SPY 200일선 필터와 QLD 하락 매수를 함께 운용한다 (scoring/topk.py).
+    - 현금은 rf(일간)를 받는다. 비용: 바뀐 비중 × BASKET_COST.
+    - state 가 있으면 start 종가 거래가 끝난 그 상태에서 이어 가고(start 날 거래 없음), 없으면 start 종가에 새로 짠다
+      (buy_cost=False 면 그 비용은 뺀다). trade_at_end=False 면 end 날에는 거래하지 않는다 (방금 끝난 기간 성과용).
+    반환: value(끝 가치, 시작 1) · trades(교체 횟수, 시작 포함) · sells[(종목, 날짜)] · w(끝 비중) · state ·
+    events[(날짜, 종류, 값)] · record=True 면 snap{날짜: (거래 전 가치, 거래 뒤 가치, 거래 뒤 상태)}"""
     C, H = _frames(reports)
-    w, _, _ = _basket_at(reports, start)
-    value = 1.0 - (sum(w.values()) * BASKET_COST if buy_cost else 0.0)
-    trades, sells = 1, []
-    if C.empty:
-        return {"value": value, "trades": trades, "sells": sells, "w": w}
+    group = (ov or {}).get("group", {})
     s0, s1 = pd.Timestamp(start), pd.Timestamp(end)
-    prev = C.loc[:s0].iloc[-1] if len(C.loc[:s0]) else C.iloc[0]
-    for d in C.index[(C.index > s0) & (C.index <= s1)]:
+    days = C.index[(C.index >= s0) & (C.index <= s1)] if not C.empty else pd.DatetimeIndex([])
+    dist, rq = _overlay_series(ov, C.index) if not C.empty else (None, None)
+    st = _copy_state(state) if state is not None else _new_state()
+    out = {"value": 1.0, "trades": 0 if state is not None else 1, "sells": [], "events": [], "snap": {}}
+
+    def dist_on(d) -> float:
+        return float(dist.loc[d]) if dist is not None and d in dist.index and pd.notna(dist.loc[d]) else float("nan")
+
+    def is_eq(t: str) -> bool:
+        return group.get(t) in EQUITY_GROUPS
+
+    def trade(d: pd.Timestamp, reb: bool, ro_prev: bool) -> float:
+        """d 종가 거래. 비용(가치 대비)을 돌려준다."""
+        day, cost, w = d.date(), 0.0, st["w"]
+        x = dist_on(d)
+        ro = x > 0
+        if reb:
+            st["cut"] = False
+            nw, _, _ = _basket_at(reports, day)
+            if ro:
+                nw = {t: v * (RISK_OFF_CUT if is_eq(t) else 1.0) for t, v in nw.items()}
+            over = sum(nw.values()) + st["q"] - 1.0
+            if over > 1e-12:
+                trim_bottom(nw, over)
+            cost += sum(abs(nw.get(t, 0.0) - w.get(t, 0.0)) for t in set(nw) | set(w)) * BASKET_COST
+            st["w"] = w = nw
+            out["events"].append((day, "rebalance", None))
+        else:
+            if ov and ro and not ro_prev and not st["cut"]:
+                cut = {t: v * (1 - RISK_OFF_CUT) for t, v in w.items() if is_eq(t)}
+                for t, v in cut.items():
+                    w[t] -= v
+                cost += sum(cut.values()) * BASKET_COST
+                st["cut"] = True
+                if cut:
+                    out["events"].append((day, "cut", list(cut)))
+            for t in [t for t in w if H.loc[d].get(t) == 0]:
+                cost += w.pop(t) * BASKET_COST
+                out["sells"].append((t, day))
+        if rq is None or x != x:
+            return cost
+        if st["blocked"] and x <= 0:
+            st["blocked"] = False
+        if st["cq"] > 0:
+            stop = st["q"] < (1 + DIP_STOP) * st["qbasis"]
+            if stop or x <= 0:
+                cost += st["q"] * BASKET_COST
+                out["events"].append((day, "dip_stop" if stop else "dip_exit",
+                                      (st["q"], st["q"] / st["qbasis"] - 1 if st["qbasis"] else float("nan"))))
+                st.update(q=0.0, cq=0.0, qbasis=0.0, t0=None, blocked=bool(stop and x > 0))
+                if not reb:   # 판 돈으로 지금 바구니 종목을 목표 비중까지 채운다
+                    for t in list(w):
+                        room = 1.0 - sum(w.values())
+                        add = min(max(0.0, (RISK_OFF_CUT if ro and is_eq(t) else 1.0) / BASKET_K - w[t]), room)
+                        if add > 0:
+                            w[t] += add
+                            cost += add * BASKET_COST
+                return cost
+        if x > 0 and not st["blocked"]:
+            tgt = dip_target(x)
+            if tgt > st["cq"] + 1e-12:
+                amt = tgt - st["cq"]
+                cash = 1.0 - sum(w.values()) - st["q"]
+                if amt > cash + 1e-12:
+                    cost += trim_bottom(w, amt - cash) * BASKET_COST
+                cost += amt * BASKET_COST
+                st["q"] += amt
+                st["qbasis"] += amt
+                st["cq"] = tgt
+                st["t0"] = st["t0"] or day
+                out["events"].append((day, "dip_buy", (amt, x)))
+        return cost
+
+    if not len(days):
+        out.update(w=st["w"], state=st)
+        return out
+    value, prev = 1.0, C.loc[days[0]]
+    if state is None:
+        c = trade(days[0], True, False)
+        value -= c if buy_cost else 0.0
+    if record:
+        out["snap"][days[0].date()] = (1.0, value, _copy_state(st))
+    pos = C.index.get_loc(days[0])
+    for i, d in enumerate(days[1:], start=1):
         c = C.loc[d]
-        cash = 1.0 - sum(w.values())
+        w = st["w"]
+        cash = 1.0 - sum(w.values()) - st["q"]
         grown = {t: x * (c[t] / prev[t]) if pd.notna(c.get(t)) and pd.notna(prev.get(t)) and prev[t] else x
                  for t, x in w.items()}
-        tot = sum(grown.values()) + cash * (1 + _rf_on(rf, d))
-        w = {t: x / tot for t, x in grown.items()}
+        gq = st["q"] * (1 + (float(rq.loc[d]) if rq is not None else 0.0))
+        tot = sum(grown.values()) + gq + cash * (1 + _rf_on(rf, d))
+        st["w"] = {t: x / tot for t, x in grown.items()}
+        st["q"], st["qbasis"] = gq / tot, st["qbasis"] / tot
+        pre, cost = value * tot, 0.0
         day = d.date()
-        if day == pd.Timestamp(end).date() and not trade_at_end:
-            pass
-        elif day in rebalance_days(day):
-            nw, _, _ = _basket_at(reports, day)
-            tot -= sum(abs(nw.get(t, 0.0) - w.get(t, 0.0)) for t in set(nw) | set(w)) * BASKET_COST
-            w, trades = nw, trades + 1
-        else:
-            out = [t for t in w if H.loc[d].get(t) == 0]
-            for t in out:
-                tot -= w.pop(t) * BASKET_COST
-                sells.append((t, day))
-        value *= tot
+        if not (day == s1.date() and not trade_at_end):
+            reb = day in rebalance_days(day)
+            cost = trade(d, reb, dist_on(C.index[pos + i - 1]) > 0)
+            out["trades"] += reb
+        value *= tot - cost   # 검증 엔진과 같이: 비용은 그날 수익률에서 뺀다 (비중은 비용 전 가치 기준)
+        if record:
+            out["snap"][day] = (pre, value, _copy_state(st))
         prev = c
-    return {"value": value, "trades": trades, "sells": sells, "w": w}
+    out.update(value=value, w=st["w"], state=st)
+    return out
+
+
+def _anchor(reports: list[TickerReport], ov: dict | None, day) -> tuple[date, bool]:
+    """day 이전(포함) 교체일 중 SPY 가 200일선 위였던 가장 최근 날 — QLD 묶음이 비어 있고 손절 잠금도 풀린 날이라
+    그날부터 계산하면 지금 상태가 정확하다. 데이터 안에 그런 날이 없으면 데이터 첫 교체일 (반환 둘째 값 False)."""
+    C, _ = _frames(reports)
+    if C.empty:
+        return day, True
+    dist, _ = _overlay_series(ov, C.index)
+    first = C.index[0].date()
+    d, last_ok = day, day
+    while d >= first:
+        last_ok = d
+        x = dist.loc[:pd.Timestamp(d)] if dist is not None else None
+        if dist is None or not len(x) or not x.iloc[-1] > 0:
+            return d, True
+        d = prev_rebalance(d)
+    return last_ok, False
+
+
+def _book(reports: list[TickerReport], start, end, rf: pd.Series | None, ov: dict | None) -> dict:
+    """start 이전의 '깨끗한 날'(_anchor)부터 end 까지 한 번에 운용한 기록 (snap 포함)."""
+    a, exact = _anchor(reports, ov, start)
+    sim = _simulate(reports, a, end, rf, ov=ov, record=True)
+    sim["exact"] = exact
+    return sim
+
+
+def _snap(sim: dict, d) -> tuple[float, float, dict]:
+    """d 종가 기록 (그날 막대가 없으면 그 전 기록)."""
+    keys = [k for k in sim["snap"] if k <= d]
+    return sim["snap"][keys[-1]] if keys else (1.0, 1.0, _new_state())
 
 
 def _entry_dates(reports: list[TickerReport], members, start) -> dict:
@@ -569,22 +714,34 @@ def _entry_dates(reports: list[TickerReport], members, start) -> dict:
     return entry
 
 
-def basket_ytd(reports: list[TickerReport], today, bench: str = "SPY", rf: pd.Series | None = None) -> dict | None:
-    """올해 누적 수익률: 작년 마지막 거래일 종가부터 규칙대로 운용했다고 가정 (_simulate)."""
-    start = month_end(today.replace(year=today.year - 1, month=12, day=1))
+def _first_day(reports: list[TickerReport]):
     hists = [r.sig["hist"] for r in reports if r.sig and r.sig.get("hist") is not None and not r.sig["hist"].empty]
-    if not hists or min(h.index[0].date() for h in hists) > start:
+    return min(h.index[0].date() for h in hists) if hists else None
+
+
+def basket_ytd(reports: list[TickerReport], today, bench: str = "SPY", rf: pd.Series | None = None,
+               ov: dict | None = None, sim: dict | None = None) -> dict | None:
+    """올해 누적 수익률: 작년 마지막 거래일 종가부터 규칙대로 운용했다고 가정 (_simulate).
+    SPY 200일선 필터·QLD 몫이 그 전부터 이어진 상태면 그 상태에서 이어 간다 (_book)."""
+    start = month_end(today.replace(year=today.year - 1, month=12, day=1))
+    first = _first_day(reports)
+    if first is None or first > start:
         return None
-    sim = _simulate(reports, start, today, rf)
+    sim = sim or _book(reports, start, today, rf, ov)
+    pre = _snap(sim, start)[0]
+    ev = [(d, k) for d, k, _ in sim["events"] if start < d <= today]
     c_s, c_t = _close_at(reports, start), _close_at(reports)
     bench_ret = c_t[bench] / c_s[bench] - 1 if bench in c_s and bench in c_t else float("nan")
-    return {"start": start, "ret": sim["value"] - 1.0, "bench": bench, "bench_ret": bench_ret,
-            "trades": sim["trades"], "sells": len(sim["sells"])}
+    return {"start": start, "ret": _snap(sim, today)[1] / pre - 1.0, "bench": bench, "bench_ret": bench_ret,
+            "trades": 1 + sum(k == "rebalance" for _, k in ev),
+            "sells": sum(start < d <= today for _, d in sim["sells"]),
+            "dip_buys": sum(k == "dip_buy" for _, k in ev)}
 
 
-def basket_state(reports: list[TickerReport], rf: pd.Series | None = None) -> dict | None:
+def basket_state(reports: list[TickerReport], rf: pd.Series | None = None, ov: dict | None = None) -> dict | None:
     """현재 바구니와 직전 바구니 대비 변화. 오늘 종가가 교체일(15일·월말)이면 '오늘 교체'.
-    reports 에는 지난해 빅테크 칸 종목(메일 표에는 안 나오는 것)도 넣어야 지난 기간 계산이 맞다."""
+    reports 에는 지난해 빅테크 칸 종목(메일 표에는 안 나오는 것)도 넣어야 지난 기간 계산이 맞다.
+    ov: SPY·QLD 종가와 종목 → 그룹 (SPY 200일선 필터·QLD 하락 매수, scoring/topk.py). 없으면 바구니만."""
     if not any(r.sig and r.sig.get("hist") is not None for r in reports):
         return None
     today = max(r.date for r in reports).date()
@@ -596,15 +753,23 @@ def basket_state(reports: list[TickerReport], rf: pd.Series | None = None) -> di
     if not sc:
         return None
     now = {r.ticker: r.sig for r in reports if r.sig}
+    ystart = month_end(today.replace(year=today.year - 1, month=12, day=1))
+    first = _first_day(reports)
+    sim = _book(reports, min(prev, ystart) if first and first <= ystart else prev, today, rf, ov)
+    pre_b, post_b, st_b = _snap(sim, base)
+    _, post_p, _ = _snap(sim, prev)
+    _, post_t, st_t = _snap(sim, today)
     # 수익률: 평소에는 이번 기간(지난 교체일 종가 → 오늘), 교체일에는 방금 끝난 기간(지난 바구니 기준)
-    sim = _simulate(reports, prev, base, rf, buy_cost=False, trade_at_end=False) if rebalance else \
-        _simulate(reports, base, today, rf, buy_cost=False)
-    sold = dict(sim["sells"])
+    lo, hi = (prev, base) if rebalance else (base, today)
+    sold = {t: d for t, d in sim["sells"] if lo < d < hi or (not rebalance and d == hi)}
+    month_ret = pre_b / post_p - 1.0 if rebalance else post_t / post_b - 1.0
     c_now, c_base, c_prev = _close_at(reports), _close_at(reports, base), _close_at(reports, prev)
     out = []
     for t in sorted(set(w0) - set(w)):
         if t in sold:
             why = f"규칙상 매도 ({_md(sold[t])} 현금화)"
+        elif t in BASKET_EXCLUDE:
+            why = "다른 주식 종목과 겹쳐 바구니 후보에서 뺌"
         elif not eligible(t, base):
             why = "빅테크 칸에서 빠짐"
         elif not hd.get(t):
@@ -629,20 +794,43 @@ def basket_state(reports: list[TickerReport], rf: pd.Series | None = None) -> di
     def period_ret(t: str, c0: dict) -> float:
         c1 = end_close(t)
         return c1 / c0[t] - 1 if c1 and t in c0 and c0[t] else float("nan")
-    rows = [{"ticker": t, "weight": w[t], "score": sc[t], "now": now.get(t, {}).get("score_s", float("nan")),
+    group = (ov or {}).get("group", {})
+    wb = st_b["w"]
+    cuts = {} if rebalance else {t: d for d, k, v in sim["events"] if k == "cut" and base < d <= today for t in v}
+    rows = [{"ticker": t, "weight": wb.get(t, 0.0), "score": sc[t], "now": now.get(t, {}).get("score_s", float("nan")),
              "new": t not in w0, "held_now": bool(now.get(t, {}).get("held", True)),
              "sold": None if rebalance else sold.get(t),
+             "half": wb.get(t, 0.0) < w[t] - 1e-9 and group.get(t) in EQUITY_GROUPS, "cut_on": cuts.get(t),
              "ret": (period_ret(t, c_prev) if t in w0 else float("nan")) if rebalance else period_ret(t, c_base),
              **since(t, ent, True)}
             for t in sorted(w, key=lambda x: (-sc[x], x))]
     out = [(t, why, since(t, ent0, False)) for t, why in out]
-    cash = max(0.0, 1.0 - sum(w.values()))
+    cash = max(0.0, 1.0 - sum(wb.values()) - st_b["q"])
     return {"today": today, "rebalance": rebalance, "base": base, "prev": prev,
             "next": next_rebalance(today), "rows": rows, "out": out, "cash": cash,
-            "cash_now": cash if rebalance else max(0.0, 1.0 - sum(sim["w"].values())),
+            "cash_now": cash if rebalance else max(0.0, 1.0 - sum(st_t["w"].values()) - st_t["q"]),
             "sold_today": [] if rebalance else [t for t, d in sold.items() if d == today],
-            "month_ret": sim["value"] - 1.0, "rf": rf is not None and not rf.empty,
-            "name": {r.ticker: r.name for r in reports}, "ytd": basket_ytd(reports, today, rf=rf)}
+            "month_ret": month_ret, "rf": rf is not None and not rf.empty,
+            "name": {r.ticker: r.name for r in reports}, "ytd": basket_ytd(reports, today, rf=rf, ov=ov, sim=sim),
+            "ov": _overlay_state(reports, ov, sim, st_b, st_t, today)}
+
+
+def _overlay_state(reports: list[TickerReport], ov: dict | None, sim: dict, st_b: dict, st_t: dict, today) -> dict | None:
+    """SPY 200일선 필터·QLD 하락 매수의 오늘 상태 (메일 표시용)."""
+    C, _ = _frames(reports)
+    dist, rq = _overlay_series(ov, C.index) if not C.empty else (None, None)
+    x = dist.loc[:pd.Timestamp(today)] if dist is not None else None
+    if x is None or not len(x) or pd.isna(x.iloc[-1]):
+        return None
+    x = float(x.iloc[-1])
+    nxt = None
+    if rq is not None and st_t["cq"] < DIP_CAP - 1e-9 and not st_t["blocked"]:
+        nxt = (max(round(st_t["cq"] / DIP_SIZE), int(max(x, 0.0) / DIP_STEP + 1e-9)) + 1) * DIP_STEP
+    return {"dist": x, "risk_off": x > 0, "qld": rq is not None, "q_base": st_b["q"], "q_now": st_t["q"],
+            "cq": st_t["cq"], "t0": st_t["t0"], "blocked": st_t["blocked"],
+            "q_ret": st_t["q"] / st_t["qbasis"] - 1 if st_t["qbasis"] else float("nan"), "next": nxt,
+            "today": [(k, v) for d, k, v in sim["events"] if d == today and k != "rebalance"],
+            "exact": sim.get("exact", True)}
 
 
 def _md(d) -> str:
@@ -664,6 +852,7 @@ def _ytd_text(b: dict) -> str | None:
         return None
     vs = "" if pd.isna(y["bench_ret"]) else f" · 같은 기간 {y['bench']} {y['bench_ret']:+.1%}"
     sells = f"·교체 사이 매도 {y['sells']}회" if y.get("sells") else ""
+    sells += f"·{DIP_TICKER} 매수 {y['dip_buys']}회" if y.get("dip_buys") else ""
     return (f"올해 누적 수익률 ({_md(y['start'])} → {_md(b['today'])} 종가, 교체 {y['trades']}회{sells}): "
             f"{y['ret']:+.1%}{vs}")
 
@@ -683,11 +872,59 @@ def _sold_text(b: dict, x: dict) -> str:
 
 def _cash_text(b: dict) -> str:
     sold = [x for x in b["rows"] if x.get("sold")]
-    return f"현금 {b['cash'] * 100:.0f}%" + (f" → 교체 사이 매도 뒤 {b['cash_now'] * 100:.0f}%" if sold else "")
+    if sold:
+        return f"현금 {b['cash'] * 100:.0f}% → 교체 사이 매도 뒤 {b['cash_now'] * 100:.0f}%"
+    return f"현금 {b['cash'] * 100:.0f}%" + ("" if abs(b["cash_now"] - b["cash"]) < 0.005 else f" → 지금 {b['cash_now'] * 100:.0f}%")
 
 
 def _cash_note(b: dict) -> str:
     return "배당 포함, 현금은 단기국채 금리" if b.get("rf") else "배당 포함, 현금 수익 0으로 계산"
+
+
+def _ov_today(o: dict) -> list[str]:
+    """오늘 종가에 난 SPY 200일선 필터·QLD 신호 (다음 거래일에 할 일)."""
+    out = []
+    for k, v in o["today"]:
+        if k == "cut":
+            out.append(f"🔻 오늘 SPY가 200일선 아래로 → 다음 거래일에 주식 종목({', '.join(v)}) 절반 매도")
+        elif k == "dip_buy":
+            out.append(f"🟢 {DIP_TICKER} {v[0]:.0%} 매수 신호 (SPY 200일선 {-v[1]:+.1%}) → 다음 거래일에 사기"
+                       " (현금이 모자라면 바구니 하위 종목부터 줄임)")
+        elif k == "dip_exit":
+            out.append(f"🔵 SPY 200일선 회복 → 다음 거래일에 {DIP_TICKER} 전량 매도 (산 금액 대비 {v[1]:+.1%}), "
+                       "그 돈으로 바구니 종목을 목표 비중까지 채우기")
+        elif k == "dip_stop":
+            out.append(f"🔴 {DIP_TICKER} 손절 (산 금액 대비 {v[1]:+.1%}) → 다음 거래일에 전량 매도, "
+                       "SPY가 200일선을 회복할 때까지 매수 중지")
+    return out
+
+
+def _ov_status(o: dict) -> list[str]:
+    """SPY 200일선 필터·QLD 보유 상태 한두 줄."""
+    pos = f"SPY 200일선 대비 {-o['dist']:+.1%}"
+    out = [f"⚠️ {pos} → 주식 종목은 절반({100 / BASKET_K * RISK_OFF_CUT:g}%)" if o["risk_off"]
+           else f"{pos} → 주식 종목 {100 / BASKET_K:g}%"]
+    if not o["qld"]:
+        out.append(f"{DIP_TICKER} 가격을 받지 못해 하락 매수 계산을 건너뜀")
+    elif o["q_now"] > 0:
+        nxt = f" · 다음 매수 SPY 200일선 −{o['next']:.0%}" if o["next"] else ""
+        out.append(f"{DIP_TICKER} {o['q_now'] * 100:.1f}% 보유 · 첫 매수 {_md(o['t0'])} · 산 금액 대비 {o['q_ret']:+.1%}{nxt} · "
+                   f"매도: 200일선 회복 또는 {DIP_STOP:.0%}")
+    elif o["blocked"]:
+        out.append(f"{DIP_TICKER}: 손절 뒤 쉬는 중 (SPY가 200일선을 회복할 때까지 매수 안 함)")
+    elif o["risk_off"] and o["next"]:
+        out.append(f"{DIP_TICKER}: SPY가 200일선 −{o['next']:.0%} 아래로 내려가면 {DIP_SIZE:.0%} 매수")
+    if not o["exact"]:
+        out.append(f"참고: SPY가 오래 200일선 아래라 {DIP_TICKER} 상태는 데이터 첫 교체일부터 추정")
+    return out
+
+
+def _half_tag(x: dict, today=None) -> str:
+    """SPY 200일선 필터 표시: 교체일에 절반으로 담은 종목, 교체 사이에 절반을 판 종목."""
+    tag = " (½ SPY 필터)" if x.get("half") else ""
+    if x.get("cut_on"):
+        tag += " → ½ 다음 거래일에 매도" if x["cut_on"] == today else f" → ½ ({_md(x['cut_on'])} SPY 필터 매도)"
+    return tag
 
 
 def _basket_lines(b: dict) -> list[str]:
@@ -698,17 +935,23 @@ def _basket_lines(b: dict) -> list[str]:
     else:
         head = f"{_md(b['base'])} 종가 기준 바구니 · 다음 교체 {_md(b['next'])} 종가 (다음 날 아침 메일)"
     lines = [head]
+    if b.get("ov"):
+        lines += _ov_today(b["ov"]) + _ov_status(b["ov"])
     for x in b["rows"]:
         tag = " (신규)" if x["new"] and b["rebalance"] else ""
         new_today = x["new"] and b["rebalance"]
         if x.get("sold"):
             ret = f" · 매도까지 {x['ret']:+.1%}" if pd.notna(x["ret"]) else ""
-            lines.append(f"{x['ticker']} {x['weight'] * 100:.1f}% · 점수 {x['score']:.0f} → 오늘 {x['now']:.0f} · "
-                         f"{_sold_text(b, x)}{ret}")
+            lines.append(f"{x['ticker']} {x['weight'] * 100:.1f}%{_half_tag(x, b['today'])} · 점수 {x['score']:.0f} → "
+                         f"오늘 {x['now']:.0f} · {_sold_text(b, x)}{ret}")
             continue
         ret = "" if new_today or pd.isna(x["ret_hold"]) else f" · 편입 후 {x['ret_hold']:+.1%} ({_since_text(x)})"
-        lines.append(f"{x['ticker']} {x['weight'] * 100:.1f}% · 점수 {x['score']:.0f}"
+        lines.append(f"{x['ticker']} {x['weight'] * 100:.1f}%{_half_tag(x, b['today'])} · 점수 {x['score']:.0f}"
                      + ("" if b["rebalance"] else f" → 오늘 {x['now']:.0f}") + ret + tag)
+    o = b.get("ov")
+    if o and (o["q_base"] > 0 or o["q_now"] > 0):
+        now_q = "" if abs(o["q_now"] - o["q_base"]) < 0.0005 else f" → 지금 {o['q_now'] * 100:.1f}%"
+        lines.append(f"{DIP_TICKER} {o['q_base'] * 100:.1f}%{now_q} (하락 매수)")
     if b["rebalance"]:
         lines += [f"제외 {t}: {why}" + ("" if pd.isna(h["ret_hold"]) else
                                        f" · 보유 기간 {h['ret_hold']:+.1%} ({_since_text(h)}"
@@ -731,6 +974,12 @@ def _basket_html(b: dict) -> str:
     else:
         parts.append(f"<p class='m' style='margin:2px 0 4px;font-size:13px'>{_md(b['base'])} 종가 기준 · "
                      f"다음 교체 {_md(b['next'])} 종가 (다음 날 아침 메일)</p>")
+    o = b.get("ov")
+    if o:
+        acts = _ov_today(o)
+        if acts:
+            parts.append("<div class='box sig'>" + "<br>".join(e(a) for a in acts) + "</div>")
+        parts.append("<p style='margin:2px 0 4px;font-size:13px'>" + "<br>".join(e(a) for a in _ov_status(o)) + "</p>")
     parts.append(f"<p style='margin:2px 0 4px;font-size:13px'>{e(_ret_label(b))}: <b>{_pct_html(b['month_ret'])}</b> "
                  f"<span class='s10'>{e(_cash_note(b))}</span></p>")
     y = b.get("ytd")
@@ -738,7 +987,8 @@ def _basket_html(b: dict) -> str:
         vs = "" if pd.isna(y["bench_ret"]) else f" <span class='m'>· 같은 기간 {e(y['bench'])} {_pct_html(y['bench_ret'])}</span>"
         parts.append(f"<p style='margin:2px 0 4px;font-size:13px'>올해 누적 수익률 ({_md(y['start'])} → {_md(b['today'])} 종가): "
                      f"<b>{_pct_html(y['ret'])}</b>{vs}<br><span class='s10'>교체 {y['trades']}회·교체 사이 매도 "
-                     f"{y['sells']}회를 규칙대로 했다고 가정 · 비용 0.05% 반영</span></p>")
+                     f"{y['sells']}회" + (f"·{DIP_TICKER} 매수 {y['dip_buys']}회" if y.get("dip_buys") else "")
+                     + "를 규칙대로 했다고 가정 · 비용 0.05% 반영</span></p>")
     parts.append("<table class='tb'><tr><th class='s'>종목</th><th class='s'>비중</th>"
                  f"<th class='s'>점수<br>{_md(b['base'])}</th>" + ("" if b["rebalance"] else "<th class='s'>점수<br>오늘</th>")
                  + "<th class='s'>비고<br>편입 후 수익률</th></tr>")
@@ -752,7 +1002,11 @@ def _basket_html(b: dict) -> str:
         else:
             note = f"<b>{_pct_html(x['ret_hold'])}</b><br><span class='s10'>{_since_text(x)}</span>"
         parts.append(f"<tr><td class='l' style='font-size:13px'><b>{e(x['ticker'])}</b><br><span class='m nm'>"
-                     f"{e(b['name'].get(x['ticker'], ''))}</span></td><td class='c'><b>{x['weight'] * 100:.1f}%</b></td>"
+                     f"{e(b['name'].get(x['ticker'], ''))}</span></td><td class='c'><b>{x['weight'] * 100:.1f}%</b>"
+                     + ("<br><span class='s10'>½ 필터</span>" if x.get("half") else "")
+                     + ("" if not x.get("cut_on") else "<br><span class='s10'>→ ½ " + ("내일 매도" if x["cut_on"] == b["today"]
+                                                                                       else f"{_md(x['cut_on'])} 매도") + "</span>")
+                     + "</td>"
                      f"<td class='c'>{_sc_badge(x['score'])}</td>"
                      + ("" if b["rebalance"] else f"<td class='c'>{_sc_badge(x['now'])}</td>")
                      + f"<td class='c' style='font-size:12px'>{note}</td></tr>")
@@ -763,7 +1017,14 @@ def _basket_html(b: dict) -> str:
                          + ("" if pd.isna(h["ret_hold"]) else
                             f"<br>보유 기간 {_pct_html(h['ret_hold'])} ({_since_text(h)}"
                             f"{_md(b['base']) if '현금화' not in why else ''})") + "</td></tr>")
-    cash_now = "" if abs(b["cash_now"] - b["cash"]) < 0.005 else f"<br><span class='s10'>매도 뒤 {b['cash_now'] * 100:.0f}%</span>"
+    if o and (o["q_base"] > 0 or o["q_now"] > 0):
+        qn = "" if abs(o["q_now"] - o["q_base"]) < 0.0005 else f"<br><span class='s10'>지금 {o['q_now'] * 100:.1f}%</span>"
+        qr = "" if pd.isna(o["q_ret"]) or not o["q_now"] else (f"<b>{_pct_html(o['q_ret'])}</b><br><span class='s10'>"
+                                                              f"{_md(o['t0'])}~ 매수가 대비</span>")
+        parts.append(f"<tr><td class='l' style='font-size:13px'><b>{DIP_TICKER}</b><br><span class='m nm'>하락 매수"
+                     f"</span></td><td class='c'><b>{o['q_base'] * 100:.1f}%</b>{qn}</td>"
+                     f"<td colspan='{1 if b['rebalance'] else 2}'></td><td class='c' style='font-size:12px'>{qr}</td></tr>")
+    cash_now = "" if abs(b["cash_now"] - b["cash"]) < 0.005 else f"<br><span class='s10'>지금 {b['cash_now'] * 100:.0f}%</span>"
     parts.append(f"<tr><td class='l m' style='font-size:13px'>현금</td><td class='c'><b>{b['cash'] * 100:.0f}%</b>{cash_now}</td>"
                  f"<td colspan='{2 if b['rebalance'] else 3}'></td></tr></table>")
     return "".join(parts)
@@ -1054,7 +1315,7 @@ def quality_lines(reports: list[TickerReport], failed: list[str], notes: list[st
 def _basket(reports: list[TickerReport], meta: dict) -> dict | None:
     """메일용 바구니. meta['basket_extra']: 메일 표에는 안 나오지만 지난 기간 계산에 필요한 종목(지난해 빅테크 칸),
     meta['rf']: 현금 일간 수익률 (단기국채 금리 ÷ 252)."""
-    return basket_state(reports + list(meta.get("basket_extra") or []), rf=meta.get("rf"))
+    return basket_state(reports + list(meta.get("basket_extra") or []), rf=meta.get("rf"), ov=meta.get("overlay"))
 
 
 def make_subject(reports: list[TickerReport], meta: dict) -> str:
@@ -1074,6 +1335,9 @@ def make_subject(reports: list[TickerReport], meta: dict) -> str:
         parts.append(f"바구니 교체 +{sum(x['new'] for x in b['rows'])} −{len(b['out'])}")
     if b and b["sold_today"]:
         parts.append(f"바구니 매도 {','.join(b['sold_today'])}")
+    for k, v in (b.get("ov") or {}).get("today", []) if b else []:
+        parts.append({"cut": "SPY 200일선 이탈·주식 절반", "dip_buy": f"{DIP_TICKER} +{v[0]:.0%}" if k == "dip_buy" else "",
+                      "dip_exit": f"{DIP_TICKER} 청산", "dip_stop": f"{DIP_TICKER} 손절"}[k])
     if g["blocked"]:
         parts.append(f"보류 {names('blocked')}")
     near = [r.ticker + "↑" for r, _ in g["near_buy"]] + [r.ticker + "↓" for r, _ in g["near_exit"]]
@@ -1110,7 +1374,7 @@ def _sections(reports: list[TickerReport], meta: dict) -> list[tuple[str, list[s
         b = _basket(reports, meta)
         if b:
             secs.append((f"바구니 (규칙 보유 중 {BASKET_N:g}점 이상 상위 {BASKET_K}개 · {100 / BASKET_K:g}%씩 · 15일·월말 교체 · "
-                         "교체 사이 규칙 매도는 바로 현금)",
+                         f"교체 사이 규칙 매도는 바로 현금 · SPY 200일선 아래면 주식 절반 · {DIP_TICKER} 하락 매수)",
                          _basket_lines(b)))
     look = market_lines(reports, meta) + _headline(reports)
     if meta.get("calendar_note"):

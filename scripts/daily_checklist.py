@@ -133,6 +133,11 @@ def main() -> None:
     except Exception:
         qld = None
     spy = bench_for("SPY", "")
+    # 올해 누적 수익률 비교: QQQ 는 표에 있고, 60/40 은 SPY 60 · AGG 40
+    try:
+        meta["bench_px"] = {"AGG": load_prices(args.source.format(t="AGG"), start)["Close"].loc[:cut]}
+    except Exception:
+        meta["bench_px"] = None
     meta["overlay"] = None if spy is None else {"spy": spy, "qld": qld,
                                                 "group": {r.ticker: r.group for r in reports + basket_extra}}
     ev_from = status["next_open"]  # 일정은 다음 거래일부터
@@ -162,7 +167,7 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
         (d / "subject.txt").write_text(subject + "\n", encoding="utf-8")
         (d / "body.txt").write_text(render_text(reports, meta) + "\n", encoding="utf-8")
-        plain = {k: v for k, v in meta.items() if k not in ("basket_extra", "rf", "overlay")}
+        plain = {k: v for k, v in meta.items() if k not in ("basket_extra", "rf", "overlay", "bench_px")}
         (d / "meta.json").write_text(json.dumps({**plain, "latest": str(latest), "subject": subject},
                                                 ensure_ascii=False, indent=2), encoding="utf-8")
     if args.out_md:

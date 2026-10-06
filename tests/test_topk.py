@@ -304,3 +304,30 @@ def test_mail_shows_filter_and_qld():
     back = dist.index[(dist.index > pd.Timestamp(nxt)) & (dist <= 0)][0].date()
     assert "QLD 청산" in make_subject(reps(str(back)), meta)
     assert basket_state(reps(str(back)), ov=ov)["ov"]["q_now"] == 0.0
+
+
+def test_ytd_compares_qqq_and_60_40():
+    """올해 누적 수익률 줄에 같은 기간 SPY · QQQ · 60/40(SPY 60 · AGG 40, 매월 리밸런싱)을 함께 보여 준다."""
+    from scoring.checklist import TickerReport, _mix_ret, basket_ytd, render_html, render_text
+    idx = pd.bdate_range("2025-12-01", "2026-09-29")
+    reps = []
+    for i, t in enumerate(["T00", "T01", "T02", "T03", "T04", "SPY", "QQQ"]):
+        jump = {"SPY": 1.10, "QQQ": 1.20}.get(t, 1.0)
+        close = np.where(idx >= "2026-03-02", 100.0 * jump, 100.0)
+        hist = pd.DataFrame({"score_s": 90.0 - i if t.startswith("T") else 30.0, "state": 1.0, "close": close}, index=idx)
+        sig = {"score": 90.0, "score_s": 90.0 - i, "prev_score_s": 90.0, "proj": 90.0, "held": True, "event": "",
+               "blocked": "", "stop": 95.0, "close": close[-1], "above200": True, "ma200": 90.0, "overheat": False,
+               "highvol": False, "recent": [], "hist": hist}
+        reps.append(TickerReport(ticker=t, name="", group="", date=idx[-1], close=close[-1], change=0.0,
+                                 from_high=0.0, checks=[], sig=sig))
+    agg = pd.Series(100.0, index=idx)
+    # 3/2 에 SPY +10%, 채권 0% → 60/40 은 +6% (2월 말에 60/40 으로 되돌린 뒤라)
+    assert _mix_ret(reps[5].sig["hist"]["close"], agg, date(2025, 12, 31), date(2026, 9, 29)) == pytest.approx(0.06)
+    y = basket_ytd(reps, date(2026, 9, 29), bench_px={"AGG": agg})
+    assert [n for n, _ in y["cmp"]] == ["SPY", "QQQ", "60/40"]
+    assert [round(r, 4) for _, r in y["cmp"]] == [0.10, 0.20, 0.06]
+    meta = {"mode": "normal", "failed": [], "bench_px": {"AGG": agg}}
+    assert "· 같은 기간 SPY +10.0% · QQQ +20.0% · 60/40 +6.0%" in render_text(reps, meta)
+    assert "SPY 60 · AGG 40" in render_html(reps, meta)
+    # 채권 가격이 없으면 60/40 은 빼고 SPY · QQQ 만
+    assert [n for n, _ in basket_ytd(reps, date(2026, 9, 29))["cmp"]] == ["SPY", "QQQ"]

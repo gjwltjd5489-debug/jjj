@@ -719,10 +719,32 @@ def _first_day(reports: list[TickerReport]):
     return min(h.index[0].date() for h in hists) if hists else None
 
 
+MIX = (0.6, "AGG")   # 비교용 60/40: SPY 60% · AGG 40%, 매월 첫 거래일에 비중 되돌림
+
+
+def _mix_ret(spy: pd.Series, bond: pd.Series, start, end) -> float:
+    """SPY·채권 60/40 (매월 리밸런싱)의 start 종가 → end 종가 수익률 (배당 포함 종가)."""
+    s0, s1 = pd.Timestamp(start), pd.Timestamp(end)
+    px = pd.concat([spy, bond.reindex(spy.index.union(bond.index)).ffill()], axis=1, keys=["s", "b"]).loc[s0:s1].dropna()
+    if len(px) < 2 or px.index[0] > s0 + pd.Timedelta(days=7) or px.index[-1] < s1 - pd.Timedelta(days=7):
+        return float("nan")
+    r = px.pct_change().iloc[1:]
+    w0 = np.array([MIX[0], 1 - MIX[0]])
+    w, v, month = w0.copy(), 1.0, px.index[0].month
+    for d, row in r.iterrows():
+        if d.month != month:
+            w, month = w0.copy(), d.month
+        g = float((w * (1 + row.to_numpy())).sum())
+        v *= g
+        w = w * (1 + row.to_numpy()) / g
+    return v - 1.0
+
+
 def basket_ytd(reports: list[TickerReport], today, bench: str = "SPY", rf: pd.Series | None = None,
-               ov: dict | None = None, sim: dict | None = None) -> dict | None:
+               ov: dict | None = None, sim: dict | None = None, bench_px: dict | None = None) -> dict | None:
     """올해 누적 수익률: 작년 마지막 거래일 종가부터 규칙대로 운용했다고 가정 (_simulate).
-    SPY 200일선 필터·QLD 몫이 그 전부터 이어진 상태면 그 상태에서 이어 간다 (_book)."""
+    SPY 200일선 필터·QLD 몫이 그 전부터 이어진 상태면 그 상태에서 이어 간다 (_book).
+    cmp: 같은 기간 SPY · QQQ · 60/40 (bench_px['AGG'] 가 있을 때) 수익률."""
     start = month_end(today.replace(year=today.year - 1, month=12, day=1))
     first = _first_day(reports)
     if first is None or first > start:
@@ -732,13 +754,23 @@ def basket_ytd(reports: list[TickerReport], today, bench: str = "SPY", rf: pd.Se
     ev = [(d, k) for d, k, _ in sim["events"] if start < d <= today]
     c_s, c_t = _close_at(reports, start), _close_at(reports)
     bench_ret = c_t[bench] / c_s[bench] - 1 if bench in c_s and bench in c_t else float("nan")
-    return {"start": start, "ret": _snap(sim, today)[1] / pre - 1.0, "bench": bench, "bench_ret": bench_ret,
+    cmp = [(bench, bench_ret)] if pd.notna(bench_ret) else []
+    if "QQQ" in c_s and "QQQ" in c_t:
+        cmp.append(("QQQ", c_t["QQQ"] / c_s["QQQ"] - 1))
+    C, _ = _frames(reports)
+    bond = (bench_px or {}).get(MIX[1])
+    if bond is not None and "SPY" in C:
+        mix = _mix_ret(C["SPY"].dropna(), bond.dropna(), start, today)
+        if pd.notna(mix):
+            cmp.append((f"{MIX[0] * 100:.0f}/{(1 - MIX[0]) * 100:.0f}", mix))
+    return {"start": start, "ret": _snap(sim, today)[1] / pre - 1.0, "bench": bench, "bench_ret": bench_ret, "cmp": cmp,
             "trades": 1 + sum(k == "rebalance" for _, k in ev),
             "sells": sum(start < d <= today for _, d in sim["sells"]),
             "dip_buys": sum(k == "dip_buy" for _, k in ev)}
 
 
-def basket_state(reports: list[TickerReport], rf: pd.Series | None = None, ov: dict | None = None) -> dict | None:
+def basket_state(reports: list[TickerReport], rf: pd.Series | None = None, ov: dict | None = None,
+                 bench_px: dict | None = None) -> dict | None:
     """현재 바구니와 직전 바구니 대비 변화. 오늘 종가가 교체일(15일·월말)이면 '오늘 교체'.
     reports 에는 지난해 빅테크 칸 종목(메일 표에는 안 나오는 것)도 넣어야 지난 기간 계산이 맞다.
     ov: SPY·QLD 종가와 종목 → 그룹 (SPY 200일선 필터·QLD 하락 매수, scoring/topk.py). 없으면 바구니만."""
@@ -811,7 +843,7 @@ def basket_state(reports: list[TickerReport], rf: pd.Series | None = None, ov: d
             "cash_now": cash if rebalance else max(0.0, 1.0 - sum(st_t["w"].values()) - st_t["q"]),
             "sold_today": [] if rebalance else [t for t, d in sold.items() if d == today],
             "month_ret": month_ret, "rf": rf is not None and not rf.empty,
-            "name": {r.ticker: r.name for r in reports}, "ytd": basket_ytd(reports, today, rf=rf, ov=ov, sim=sim),
+            "name": {r.ticker: r.name for r in reports}, "ytd": basket_ytd(reports, today, rf=rf, ov=ov, sim=sim, bench_px=bench_px),
             "ov": _overlay_state(reports, ov, sim, st_b, st_t, today)}
 
 
@@ -850,7 +882,8 @@ def _ytd_text(b: dict) -> str | None:
     y = b.get("ytd")
     if not y:
         return None
-    vs = "" if pd.isna(y["bench_ret"]) else f" · 같은 기간 {y['bench']} {y['bench_ret']:+.1%}"
+    cmp = y.get("cmp") or ([] if pd.isna(y["bench_ret"]) else [(y["bench"], y["bench_ret"])])
+    vs = (" · 같은 기간 " + " · ".join(f"{n} {r:+.1%}" for n, r in cmp)) if cmp else ""
     sells = f"·교체 사이 매도 {y['sells']}회" if y.get("sells") else ""
     sells += f"·{DIP_TICKER} 매수 {y['dip_buys']}회" if y.get("dip_buys") else ""
     return (f"올해 누적 수익률 ({_md(y['start'])} → {_md(b['today'])} 종가, 교체 {y['trades']}회{sells}): "
@@ -985,7 +1018,10 @@ def _basket_html(b: dict) -> str:
                  f"<span class='s10'>{e(_cash_note(b))}</span></p>")
     y = b.get("ytd")
     if y:
-        vs = "" if pd.isna(y["bench_ret"]) else f" <span class='m'>· 같은 기간 {e(y['bench'])} {_pct_html(y['bench_ret'])}</span>"
+        cmp = y.get("cmp") or ([] if pd.isna(y["bench_ret"]) else [(y["bench"], y["bench_ret"])])
+        vs = ("" if not cmp else "<br><span class='m'>같은 기간 " + " · ".join(f"{e(n)} {_pct_html(r)}" for n, r in cmp)
+              + (" <span class='s10'>(60/40 = SPY 60 · AGG 40, 매월 리밸런싱)</span>" if any("/" in n for n, _ in cmp) else "")
+              + "</span>")
         parts.append(f"<p style='margin:2px 0 4px;font-size:13px'>올해 누적 수익률 ({_md(y['start'])} → {_md(b['today'])} 종가): "
                      f"<b>{_pct_html(y['ret'])}</b>{vs}<br><span class='s10'>교체 {y['trades']}회·교체 사이 매도 "
                      f"{y['sells']}회" + (f"·{DIP_TICKER} 매수 {y['dip_buys']}회" if y.get("dip_buys") else "")
@@ -1315,8 +1351,10 @@ def quality_lines(reports: list[TickerReport], failed: list[str], notes: list[st
 
 def _basket(reports: list[TickerReport], meta: dict) -> dict | None:
     """메일용 바구니. meta['basket_extra']: 메일 표에는 안 나오지만 지난 기간 계산에 필요한 종목(지난해 빅테크 칸),
-    meta['rf']: 현금 일간 수익률 (단기국채 금리 ÷ 252)."""
-    return basket_state(reports + list(meta.get("basket_extra") or []), rf=meta.get("rf"), ov=meta.get("overlay"))
+    meta['rf']: 현금 일간 수익률 (단기국채 금리 ÷ 252), meta['overlay']: SPY·QLD 종가와 그룹,
+    meta['bench_px']: 비교용 종가 (AGG → 60/40)."""
+    return basket_state(reports + list(meta.get("basket_extra") or []), rf=meta.get("rf"), ov=meta.get("overlay"),
+                        bench_px=meta.get("bench_px"))
 
 
 def make_subject(reports: list[TickerReport], meta: dict) -> str:

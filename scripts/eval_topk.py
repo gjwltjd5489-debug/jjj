@@ -2,7 +2,7 @@
 
 규칙
 - 리밸런싱일 종가에 3일 평균 점수가 n 이상인 종목 중 점수 상위 k개를 1/k씩 담는다 (다음 날부터 수익 반영).
-- 경계에서 점수가 같은 종목들은 남은 자리를 나눠 갖는다. n 이상이 k개보다 적으면 빈자리는 현금.
+- 경계에서 점수가 같으면 최근 60거래일 수익률이 높은 종목이 들어간다. n 이상이 k개보다 적으면 빈자리는 현금.
 - '규칙 보유 중' 변형: 후보를 지금 매수·매도 규칙상 보유 구간인 종목으로 한정한다.
 - 리밸런싱 사이에는 비중이 가격 따라 움직이고, 리밸런싱 때 바뀐 비중만큼 편도 0.05% 비용.
 
@@ -30,6 +30,7 @@ from scoring import get_profile  # noqa: E402
 from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.checklist_score import checklist_score, strategy_returns  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
+from scoring.topk import MOM_DAYS  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
 
 BACKFILL = {"PDBC": "PDBC+DBC"}
@@ -49,6 +50,7 @@ class Book:
         self.dates, self.cols = S.index, S.columns
         self.s = S.to_numpy()
         self.r = C.pct_change().fillna(0.0).to_numpy()
+        self.mom = (C / C.shift(MOM_DAYS) - 1).to_numpy()
         self.h = H.fillna(0.0).to_numpy() == 1
         self.month_end = np.r_[self.dates[1:].month != self.dates[:-1].month, True]
         nxt = np.r_[self.dates[1:].day, 99]
@@ -69,11 +71,10 @@ class Book:
         if rng is not None:
             w[rng.choice(np.flatnonzero(elig), k, replace=False)] = 1.0 / k
             return w
-        sc = np.where(elig, s, -np.inf)
-        v = np.sort(sc)[-k]
-        above, tie = sc > v, sc == v
-        w[above] = 1.0 / k
-        w[tie] = (k - above.sum()) / (tie.sum() * k)
+        # 점수 → 최근 MOM_DAYS 거래일 수익률 → 열 이름 순 (메일의 basket_weights 와 같음)
+        mom = np.where(np.isnan(self.mom[d]), -np.inf, self.mom[d])
+        order = sorted(np.flatnonzero(elig), key=lambda i: (-s[i], -mom[i], self.cols[i]))
+        w[order[:k]] = 1.0 / k
         return w
 
     def run(self, n: float, k: int, every: int, rule: bool = False, rng=None, mid_exit: bool = False,

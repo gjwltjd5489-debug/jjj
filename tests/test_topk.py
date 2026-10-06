@@ -12,7 +12,13 @@ from scoring.topk import (basket_weights, mid_month, month_end, next_month_end, 
 def test_basket_weights_top_k_ties_and_cash():
     sc = {"A": 90.0, "B": 80.0, "C": 80.0, "D": 70.0, "E": 55.0, "F": 95.0}
     held = {t: True for t in sc} | {"F": False}          # F 는 규칙상 보유가 아니라 제외
-    assert basket_weights(sc, held, n=60, k=2) == {"A": 0.5, "B": 0.25, "C": 0.25}  # 동점 B·C 가 한 자리를 나눔
+    # 동점 B·C: 최근 60거래일 수익률이 높은 C 가 들어간다 (자리를 나누지 않음). 수익률이 없으면 알파벳 순
+    assert basket_weights(sc, held, n=60, k=2, mom={"B": 0.05, "C": 0.12}) == {"A": 0.5, "C": 0.5}
+    assert basket_weights(sc, held, n=60, k=2) == {"A": 0.5, "B": 0.5}
+    # 9/30 실제 사례: 5위 동점(NVDA·SOXX 92) → 5개만
+    real = {"AMD": 100, "UUP": 100, "PLTR": 99.0, "DBMF": 93.3, "NVDA": 91.7, "SOXX": 91.7}
+    w = basket_weights(real, {t: True for t in real}, mom={"NVDA": 0.21, "SOXX": 0.26})
+    assert len(w) == 5 and "SOXX" in w and "NVDA" not in w and all(v == 0.2 for v in w.values())
     w = basket_weights(sc, held, n=60, k=10)             # 후보 4개 → 10%씩, 현금 60%
     assert set(w) == {"A", "B", "C", "D"} and abs(sum(w.values()) - 0.4) < 1e-12
 

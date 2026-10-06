@@ -17,7 +17,8 @@ from .profiles import Profile
 from .checklist_score import RULE, checklist_score, points_from_verdicts
 from .indicators import rolling_pct_rank
 from .bigtech import eligible
-from .topk import BASKET_K, BASKET_N, basket_weights, month_end, next_rebalance, prev_rebalance, rebalance_days
+from .topk import (BASKET_K, BASKET_N, MOM_DAYS, basket_weights, month_end, next_rebalance, prev_rebalance,
+                   rebalance_days)
 from .score import compute_indicators
 
 UP, DOWN, WARN, NEUTRAL = "✅", "❌", "⚠️", "➖"
@@ -420,7 +421,7 @@ def holdings(reports: list[TickerReport]) -> list[TickerReport]:
 # ---------------------------------------------------------------- 바구니 (docs/topk.md)
 
 BASKET_RULE = (f"규칙상 보유 종목 중 3일 평균 {BASKET_N:g}점 이상 상위 {BASKET_K}개를 {100 / BASKET_K:g}%씩, "
-               "매월 15일(휴장이면 직전 거래일)·마지막 거래일 종가 기준으로 교체. "
+               "매월 15일(휴장이면 직전 거래일)·마지막 거래일 종가 기준으로 교체 (점수가 같으면 최근 60거래일 수익률 순). "
                "교체 사이에 규칙 매도 신호가 나면 바로 팔아 현금으로 두고, 빈자리와 현금은 단기국채 금리를 받는다고 계산")
 
 
@@ -438,6 +439,25 @@ def _state_at(reports: list[TickerReport], d) -> tuple[dict, dict]:
             scores[r.ticker] = float(h["score_s"].iloc[-1])
             held[r.ticker] = h["state"].iloc[-1] == 1
     return scores, held
+
+
+def _mom_at(reports: list[TickerReport], d) -> dict[str, float]:
+    """d 종가 기준 최근 MOM_DAYS 거래일 수익률 (바구니 동점 가르기용)."""
+    out = {}
+    for r in reports:
+        h = r.sig.get("hist") if r.sig else None
+        if h is None or h.empty:
+            continue
+        c = h["close"].loc[: pd.Timestamp(d)]
+        if len(c) > MOM_DAYS and c.iloc[-1 - MOM_DAYS]:
+            out[r.ticker] = float(c.iloc[-1] / c.iloc[-1 - MOM_DAYS] - 1)
+    return out
+
+
+def _basket_at(reports: list[TickerReport], d) -> tuple[dict, dict, dict]:
+    """d 종가 기준 (바구니 비중, 3일 평균 점수, 규칙상 보유)."""
+    sc, hd = _state_at(reports, d)
+    return basket_weights(sc, hd, mom=_mom_at(reports, d)), sc, hd
 
 
 def _close_at(reports: list[TickerReport], d=None) -> dict[str, float]:
@@ -492,8 +512,7 @@ def _simulate(reports: list[TickerReport], start, end, rf: pd.Series | None = No
     trade_at_end=False 면 end 가 교체일이어도 그날 교체는 하지 않음 — 방금 끝난 기간 성과용).
     반환: value(끝 가치, 시작 1), trades(교체 횟수, 시작 포함), sells[(종목, 날짜)], w(끝 비중)"""
     C, H = _frames(reports)
-    sc, hd = _state_at(reports, start)
-    w = basket_weights(sc, hd)
+    w, _, _ = _basket_at(reports, start)
     value = 1.0 - (sum(w.values()) * BASKET_COST if buy_cost else 0.0)
     trades, sells = 1, []
     if C.empty:
@@ -511,8 +530,7 @@ def _simulate(reports: list[TickerReport], start, end, rf: pd.Series | None = No
         if day == pd.Timestamp(end).date() and not trade_at_end:
             pass
         elif day in rebalance_days(day):
-            sc, hd = _state_at(reports, day)
-            nw = basket_weights(sc, hd)
+            nw, _, _ = _basket_at(reports, day)
             tot -= sum(abs(nw.get(t, 0.0) - w.get(t, 0.0)) for t in set(nw) | set(w)) * BASKET_COST
             w, trades = nw, trades + 1
         else:
@@ -540,8 +558,7 @@ def _entry_dates(reports: list[TickerReport], members, start) -> dict:
         if d < first:
             entry.update({t: (entry[t][0], True) for t in track})
             break
-        sc, hd = _state_at(reports, d)
-        w = basket_weights(sc, hd)
+        w, _, _ = _basket_at(reports, d)
         between = H.loc[(H.index > pd.Timestamp(d)) & (H.index < pd.Timestamp(later))]
         for t in list(track):
             if t in w and (t not in between or bool((between[t].dropna() == 1).all())):
@@ -574,11 +591,10 @@ def basket_state(reports: list[TickerReport], rf: pd.Series | None = None) -> di
     rebalance = today in rebalance_days(today)
     base = today if rebalance else prev_rebalance(today)
     prev = prev_rebalance(base)
-    sc, hd = _state_at(reports, base)
-    sc0, hd0 = _state_at(reports, prev)
+    w, sc, hd = _basket_at(reports, base)
+    w0, _, _ = _basket_at(reports, prev)
     if not sc:
         return None
-    w, w0 = basket_weights(sc, hd), basket_weights(sc0, hd0)
     now = {r.ticker: r.sig for r in reports if r.sig}
     # 수익률: 평소에는 이번 기간(지난 교체일 종가 → 오늘), 교체일에는 방금 끝난 기간(지난 바구니 기준)
     sim = _simulate(reports, prev, base, rf, buy_cost=False, trade_at_end=False) if rebalance else \

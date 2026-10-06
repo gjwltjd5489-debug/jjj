@@ -908,7 +908,8 @@ def _ov_status(o: dict) -> list[str]:
         out.append(f"{DIP_TICKER} 가격을 받지 못해 하락 매수 계산을 건너뜀")
     elif o["q_now"] > 0:
         nxt = f" · 다음 매수 SPY 200일선 −{o['next']:.0%}" if o["next"] else ""
-        out.append(f"{DIP_TICKER} {o['q_now'] * 100:.1f}% 보유 · 첫 매수 {_md(o['t0'])} · 산 금액 대비 {o['q_ret']:+.1%}{nxt} · "
+        held = "보유 (오늘 신호분 포함)" if any(k == "dip_buy" for k, _ in o["today"]) else "보유"
+        out.append(f"{DIP_TICKER} {o['q_now'] * 100:.1f}% {held} · 첫 매수 {_md(o['t0'])} · 산 금액 대비 {o['q_ret']:+.1%}{nxt} · "
                    f"매도: 200일선 회복 또는 {DIP_STOP:.0%}")
     elif o["blocked"]:
         out.append(f"{DIP_TICKER}: 손절 뒤 쉬는 중 (SPY가 200일선을 회복할 때까지 매수 안 함)")

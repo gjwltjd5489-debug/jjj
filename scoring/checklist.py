@@ -21,6 +21,12 @@ from .score import compute_indicators
 
 UP, DOWN, WARN, NEUTRAL = "✅", "❌", "⚠️", "➖"
 
+# 단기 반등 후보: 200일선 위에서 나온 단기 급락 신호 → 과거(29종목, 2005~2026) 같은 종목·같은 국면의
+# 평소보다 높았던 이후 수익. 이평 돌파·MACD·구름·신고가·스퀴즈 등 나머지 이벤트는 이후 수익률과
+# 무관해서 메일에서 뺐다 (docs/events.md).
+REBOUND = {"RSI 30 진입": "5일 +0.9%p", "ADX 25 상향 (하락 방향)": "5일 +0.8%p", "볼린저 하단 이탈": "20일 +0.8%p"}
+REBOUND_NOTE = "200일선 위 단기 급락 · 과거 평소 대비 이후 수익 · 매매 신호 아님"
+
 
 @dataclass
 class Check:
@@ -43,7 +49,7 @@ class TickerReport:
     change: float
     from_high: float
     checks: list[Check]
-    events: list[str] = field(default_factory=list)
+    rebound: list[str] = field(default_factory=list)  # 오늘 나온 단기 반등 후보 신호 (REBOUND)
     prev_checks: list[Check] | None = None   # 직전 거래일 체크리스트
     issues: list[str] = field(default_factory=list)  # 데이터 점검 경고
     sig: dict | None = None  # 체크리스트 점수 기반 매수·매도 신호 (scoring/checklist_score.py)
@@ -105,12 +111,9 @@ def build_report(df: pd.DataFrame, p: Profile, ticker: str, name: str = "", grou
     """bench: 상대강도 비교 대상 종가 (없으면 상대강도는 '해당 없음')."""
     x = compute_indicators(df, p, bench)
     close = x["close"]
-    mid = close.rolling(p.bb_period).mean()
-    sd = close.rolling(p.bb_period).std(ddof=0)
-    bandwidth = 4 * sd / mid
     r = x.iloc[-1]
     c = r["close"]
-    s, m, lng = f"{p.ma_short}일", f"{p.ma_mid}일", f"{p.ma_long}일"
+    m, lng = f"{p.ma_mid}일", f"{p.ma_long}일"
     checks: list[Check] = []
 
     def na(group_, name_):
@@ -239,54 +242,23 @@ def build_report(df: pd.DataFrame, p: Profile, ticker: str, name: str = "", grou
     for chk in checks:
         chk.short = shorts.get(chk.name) or ("" if chk.na else chk.detail.replace("전환선 ", "전환").replace(" 기준선", "기준"))
 
-    # 오늘 이벤트
+    # 단기 반등 후보: 200일선 위에서의 단기 급락 (REBOUND)
     ev: list[str] = []
-    if _crossed_up(x["ma_mid"], x["ma_long"]) or any(_crossed_up(x["ma_mid"], x["ma_long"], k) for k in range(-5, -1)):
-        ev.append(f"골든크로스 ({m}선 > {lng}선, 최근 5일)")
-    if _crossed_down(x["ma_mid"], x["ma_long"]) or any(_crossed_down(x["ma_mid"], x["ma_long"], k) for k in range(-5, -1)):
-        ev.append(f"데드크로스 ({m}선 < {lng}선, 최근 5일)")
-    for label, col in ((s, "ma_short"), (lng, "ma_long")):
-        if _crossed_up(close, x[col]):
-            ev.append(f"{label}선 상향 돌파")
-        if _crossed_down(close, x[col]):
-            ev.append(f"{label}선 하향 이탈")
-    if _crossed_up(x["macd"], x["signal"]):
-        ev.append("MACD 시그널 상향 교차")
-    if _crossed_down(x["macd"], x["signal"]):
-        ev.append("MACD 시그널 하향 교차")
-    cloud_top = x[["span_a", "span_b"]].max(axis=1)
-    cloud_bottom = x[["span_a", "span_b"]].min(axis=1)
-    if _crossed_up(close, cloud_top):
-        ev.append("일목 구름 상향 돌파")
-    if _crossed_down(close, cloud_bottom):
-        ev.append("일목 구름 하향 이탈")
-    if _crossed_up(x["tenkan"], x["kijun"]):
-        ev.append("전환선 > 기준선 교차 (호전)")
-    if _crossed_down(x["tenkan"], x["kijun"]):
-        ev.append("전환선 < 기준선 교차 (역전)")
-    if _crossed_up(x["adx"], 25):
-        ev.append(f"ADX 25 상향 ({'상승' if r['plus_di'] > r['minus_di'] else '하락'}추세 시작)")
-    if _crossed_up(x["rsi"], 70):
-        ev.append("RSI 70 진입 (과매수)")
-    if _crossed_down(x["rsi"], 30):
-        ev.append("RSI 30 진입 (과매도)")
-    if _crossed_up(x["pct_b"], 1):
-        ev.append("볼린저 상단 돌파")
-    if _crossed_down(x["pct_b"], 0):
-        ev.append("볼린저 하단 이탈")
-    bw = bandwidth.dropna()
-    if len(bw) > 126 and bw.iloc[-1] <= bw.iloc[-126:].min():
-        ev.append("볼린저 밴드폭 6개월 최저 (스퀴즈, 큰 움직임 전조)")
+    if pd.notna(r["ma_long"]) and c > r["ma_long"]:
+        if _crossed_down(x["rsi"], 30):
+            ev.append("RSI 30 진입")
+        if _crossed_up(x["adx"], 25) and r["plus_di"] <= r["minus_di"]:
+            ev.append("ADX 25 상향 (하락 방향)")
+        if _crossed_down(x["pct_b"], 0):
+            ev.append("볼린저 하단 이탈")
     hi252 = close.rolling(252, min_periods=60).max()
-    if c >= hi252.iloc[-1]:
-        ev.append("52주 신고가")
 
     prev = close.iloc[-2] if len(close) > 1 else np.nan
     return TickerReport(
         ticker=ticker, name=name, group=group, date=x.index[-1], close=float(c),
         change=float(c / prev - 1) if prev else np.nan,
         from_high=float(c / hi252.iloc[-1] - 1) if pd.notna(hi252.iloc[-1]) else np.nan,
-        checks=checks, events=ev,
+        checks=checks, rebound=ev,
     )
 
 
@@ -1027,8 +999,7 @@ def _sections(reports: list[TickerReport], meta: dict) -> list[tuple[str, list[s
         secs.append((f"전일 대비 변화 — {summary}", cl or ["없음"]))
         secs.append(("성향별 판정 (3일 평균 점수: 장기 중기 모멘텀 추세 거래량 상대 / 변동성 과열)",
                      [_compact_row(r) for r in reports]))
-    ev = [f"{r.ticker}: {', '.join(r.events)}" for r in reports if r.events]
-    secs.append(("직전 거래일 이벤트" if holiday else "오늘의 이벤트", ev or ["없음"]))
+    secs.append((f"{'직전 거래일 ' if holiday else ''}단기 반등 후보 ({REBOUND_NOTE})", rebound_lines(reports) or ["없음"]))
     if not holiday:
         items = recent_signals(reports)
         secs.append((f"최근 {RECENT_DAYS}거래일 신호 기록",
@@ -1157,12 +1128,16 @@ def _recent_html(reports: list[TickerReport]) -> str:
             + "".join(rows) + "</table>" + more)
 
 
-def _events_html(reports: list[TickerReport], title: str) -> str:
+def rebound_lines(reports: list[TickerReport]) -> list[str]:
+    """예: 'SOXX: RSI 30 진입 (과거 5일 +0.9%p)'."""
+    return [f"{r.ticker}: " + ", ".join(f"{k} (과거 {REBOUND[k]})" for k in r.rebound) for r in reports if r.rebound]
+
+
+def _rebound_html(reports: list[TickerReport], title: str) -> str:
     e = html.escape
-    evs = [r for r in reports if r.events]
-    return f"<h3>{e(title)}</h3>" + (
-        "<ul>" + "".join(f"<li><b>{e(r.ticker)}</b>: {e(', '.join(r.events))}</li>" for r in evs) + "</ul>"
-        if evs else "<p class='m'>없음</p>")
+    lines = rebound_lines(reports)
+    return (f"<h3>{e(title)} <span class='m' style='font-weight:normal;font-size:12px'>— {e(REBOUND_NOTE)}</span></h3>"
+            + (_ul(lines, e) if lines else "<p class='m'>없음</p>"))
 
 
 def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
@@ -1183,7 +1158,7 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
         parts.append(f"<h2 style='margin:0 0 8px'>🇺🇸 미국장 휴장 · {e(str(meta['checked']))} {e(meta['holiday'])}</h2>")
         parts.append(f"<p>다음 거래일: <b>{e(str(meta['next_open']))}</b>. 새 종가가 없어 체크리스트는 "
                      f"직전 거래일({date}) 기준이며 변화는 없습니다.</p>")
-        parts += [qbox, f"<h3>직전 거래일({date}) 요약</h3>" + look_html, _events_html(reports, "직전 거래일 이벤트"), footer]
+        parts += [qbox, f"<h3>직전 거래일({date}) 요약</h3>" + look_html, _rebound_html(reports, "직전 거래일 단기 반등 후보"), footer]
         return "".join(parts)
 
     parts.append(f"<h2 style='margin:0 0 6px'>미국장 지표 체크리스트 <span class='m' style='font-weight:normal'>({date} 종가)</span></h2>")
@@ -1198,5 +1173,5 @@ def render_html(reports: list[TickerReport], meta: dict | None = None) -> str:
     parts.append("<h3>성향별 판정 <span class='m' style='font-weight:normal;font-size:12px'>"
                  f"점수 {RULE.entry:g} 이상 🟢 · {RULE.exit:g} 이하 🔴 · 노란 칸 = 전일과 색이 바뀐 성향</span></h3>")
     parts.append(_table_html(reports))
-    parts += [_events_html(reports, "오늘의 이벤트"), _recent_html(reports), footer]
+    parts += [_rebound_html(reports, "단기 반등 후보"), _recent_html(reports), footer]
     return "".join(parts)

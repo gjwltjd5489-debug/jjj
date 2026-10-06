@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 from scoring import get_profile
-from scoring.checklist import DOWN, UP, build_report, render_html, render_markdown
+from scoring.checklist import DOWN, REBOUND, UP, build_report, render_html, render_markdown
 from tests.test_scoring import synthetic
 
 P = get_profile("QQQ")
@@ -25,7 +25,7 @@ def test_uptrend_mostly_bullish_and_renders():
     assert up.verdicts()["장기 추세"] == "↑" and down.verdicts()["장기 추세"] == "↓"
     md = render_markdown([up, down])
     page = render_html([up, down])
-    assert "| UP |" in md and "오늘의 이벤트" in md and "성향별 판정" in md
+    assert "| UP |" in md and "단기 반등 후보" in md and "성향별 판정" in md
     assert "<table" in page and "UP" in page
 
 
@@ -34,11 +34,30 @@ def test_missing_volume_marks_neutral():
     assert r.check("VR").na and r.verdicts()["거래량"] == "–"
 
 
-def test_detects_20ma_breakout_event():
-    df = synthetic(n=400, drift=-0.001, seed=4)
-    df.iloc[-1, df.columns.get_loc("Close")] = df["Close"].iloc[-30:].max() * 1.1
-    r = build_report(df, P, "X")
-    assert "20일선 상향 돌파" in r.events
+def _dip(drift) -> tuple[pd.DataFrame, list[list[str]]]:
+    """시계열 끝에 6일 연속 −1.5% 급락을 붙이고, 급락 각 날짜까지 잘라 만든 반등 후보 목록."""
+    df = smooth(drift)
+    df.iloc[-6:, df.columns.get_loc("Close")] = df["Close"].iloc[-7] * 0.985 ** np.arange(1, 7)
+    return df, [build_report(df.iloc[:k], P, "X").rebound for k in range(len(df) - 6, len(df) + 1)]
+
+
+def test_rebound_candidate_only_above_200ma():
+    from scoring.score import compute_indicators
+    _, up = _dip(0.002)                      # 200일선 위에서 급락 → RSI 30 진입이 하루 잡힌다
+    assert sum("RSI 30 진입" in ev for ev in up) == 1
+    assert all(set(ev) <= set(REBOUND) for ev in up)
+    # 하락 뒤 횡보(200일선 아래, RSI 50 안팎)에서 같은 급락 → RSI 30 진입은 나지만 후보는 아님
+    df, below = _dip(np.r_[np.full(300, 0.002), np.full(150, -0.003), np.zeros(150)])
+    x = compute_indicators(df, P)
+    assert x["close"].iloc[-1] < x["ma_long"].iloc[-1] and (x["rsi"].iloc[-7] > 30) and (x["rsi"].iloc[-1] < 30)
+    assert not any(below)
+
+
+def test_rebound_section_renders():
+    rep = build_report(smooth(0.002), P, "UP")
+    rep.rebound = ["RSI 30 진입"]
+    assert "UP: RSI 30 진입 (과거 5일 +0.9%p)" in render_markdown([rep])
+    assert "단기 반등 후보" in render_html([rep]) and "과거 5일 +0.9%p" in render_html([rep])
 
 
 # ---------------------------------------------------------------- 휴장일, 변화, 데이터 점검

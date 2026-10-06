@@ -30,6 +30,20 @@ def fx_summary(close: pd.Series) -> dict | None:
             "m1": float(last / month.iloc[-1] - 1) if len(month) else float("nan")}
 
 
+def tbill_daily(start: str) -> pd.Series | None:
+    """현금 일간 수익률: 13주 미국 단기국채 금리(^IRX, 연 %) ÷ 100 ÷ 252. 실패하면 None (현금 수익 0으로 계산)."""
+    try:
+        import yfinance as yf
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        x = yf.download("^IRX", start=start, progress=False, auto_adjust=False)["Close"].squeeze().dropna()
+    except Exception:
+        return None
+    if x is None or not len(x):
+        return None
+    x.index = pd.to_datetime(x.index).tz_localize(None)
+    return x / 100 / 252
+
+
 def macro_events(path: Path = MACRO_FILE) -> list[tuple[date, str, str]]:
     """(날짜, 종류, 설명) 목록."""
     try:

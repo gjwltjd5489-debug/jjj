@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
+from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.checklist_score import EQUAL, RULE, checklist_score, strategy_returns  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
 from scoring.score import compute_all  # noqa: E402
@@ -52,7 +53,7 @@ def main() -> None:
     ap.add_argument("--md", help="결과 마크다운 저장")
     args = ap.parse_args()
 
-    wl = pd.read_csv(args.watchlist, dtype=str).fillna("")
+    wl = load_watchlist(args.watchlist)
     cache: dict[str, pd.DataFrame] = {}
 
     def prices(t):

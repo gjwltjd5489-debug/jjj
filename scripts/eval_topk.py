@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
+from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.checklist_score import checklist_score, strategy_returns  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
@@ -75,16 +76,25 @@ class Book:
         w[tie] = (k - above.sum()) / (tie.sum() * k)
         return w
 
-    def run(self, n: float, k: int, every: int, rule: bool = False, rng=None) -> tuple[pd.Series, float, dict]:
+    def run(self, n: float, k: int, every: int, rule: bool = False, rng=None, mid_exit: bool = False,
+            rf: np.ndarray | None = None) -> tuple[pd.Series, float, dict]:
+        """mid_exit: 교체 사이에 규칙 매도(보유 상태 0)가 나면 그날 종가에 팔아 현금 · rf: 현금 일간 수익률 (날짜 순)."""
         w = np.zeros(len(self.cols))
         out = np.zeros(len(self.dates))
         turn, cnt, cash, tech = 0.0, [], [], []
         ti = [i for i, c in enumerate(self.cols) if c in TECH]
         for d in range(len(self.dates)):
-            out[d] = (w * self.r[d]).sum()
+            out[d] = (w * self.r[d]).sum() + ((1 - w.sum()) * rf[d] if rf is not None else 0.0)
             grown = w * (1 + self.r[d])
             w = grown / (1 + out[d]) if 1 + out[d] > 0 else grown
-            if (self.month_end[d] if every == 0 else self.semi[d] if every == -1 else d % every == 0):
+            reb = self.month_end[d] if every == 0 else self.semi[d] if every == -1 else d % every == 0
+            if mid_exit and not reb:
+                sell = (w > 0) & ~self.h[d]
+                if sell.any():
+                    turn += w[sell].sum()
+                    out[d] -= w[sell].sum() * COST
+                    w[sell] = 0.0
+            if reb:
                 nw = self.target(d, n, k, rule, rng)
                 tc = np.abs(nw - w).sum()
                 turn += tc
@@ -119,7 +129,7 @@ def main() -> None:
     periods = [("2006~2017", pd.Timestamp("2006-01-01"), pd.Timestamp("2017-12-31")),
                (f"2018~{(A - pd.Timedelta(days=1)).date()}", pd.Timestamp("2018-01-01"), A - pd.Timedelta(days=1)),
                ("최근 1년", A, end)]
-    wl = pd.read_csv(args.watchlist, dtype=str).fillna("")
+    wl = load_watchlist(args.watchlist)
     cache: dict[str, pd.DataFrame] = {}
 
     def prices(t: str) -> pd.DataFrame:

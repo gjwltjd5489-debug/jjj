@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
+from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.checklist_score import EQUAL, RULE, WEIGHTS, checklist_score, strategy_returns  # noqa: E402
 from scoring.indicators import atr  # noqa: E402
 from scoring.portfolio import perf_stats  # noqa: E402
@@ -154,7 +155,7 @@ def main() -> None:
     periods = [("2006~2017", pd.Timestamp("2006-01-01"), split - pd.Timedelta(days=1)),
                (f"2018~{(A - pd.Timedelta(days=1)).date()}", split, A - pd.Timedelta(days=1)),
                ("최근 1년", A, end)]
-    wl = pd.read_csv(args.watchlist, dtype=str).fillna("")
+    wl = load_watchlist(args.watchlist)
     cache: dict[str, pd.DataFrame] = {}
 
     def prices(t: str) -> pd.DataFrame:

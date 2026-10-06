@@ -74,10 +74,14 @@ def test_basket_state_between_and_on_rebalance_day():
     assert not mid["rebalance"] and mid["base"] == date(2026, 9, 15) and mid["next"] == date(2026, 9, 30)
     assert [x["ticker"] for x in mid["rows"]] == [f"T{i:02d}" for i in range(5)]
     assert all(abs(x["weight"] - 0.2) < 1e-12 for x in mid["rows"])
-    assert not next(x for x in mid["rows"] if x["ticker"] == "T03")["held_now"]  # 교체 사이 매도 신호 표시
-    # 이번 기간 수익률: T04 +10%, 나머지 0% → 바구니 +2% (20%씩)
+    t03 = next(x for x in mid["rows"] if x["ticker"] == "T03")
+    # 교체 사이 규칙 매도: 9/16 종가에 팔아 현금 (다음 교체일까지 들고 있지 않음)
+    assert not t03["held_now"] and t03["sold"] == date(2026, 9, 16) and abs(t03["ret"]) < 1e-12
+    assert abs(mid["cash_now"] - 0.2 / 1.02) < 1e-9
+    # 이번 기간 수익률: T04 +10%, 나머지 0% → 바구니 +2% (20%씩), T03 판 비용 0.05% (9/16 비중 0.2/1.02)
     assert abs(next(x for x in mid["rows"] if x["ticker"] == "T04")["ret"] - 0.10) < 1e-12
-    assert abs(mid["month_ret"] - 0.02) < 1e-12
+    sell_cost = 0.2 / 1.02 * 0.0005
+    assert abs(mid["month_ret"] - (0.02 - sell_cost)) < 1e-12
     # 편입 후 수익률: T04 는 8/14·8/31·9/15 바구니에 계속 있었다 → 데이터 첫 교체일(8/14)부터, 더 이전은 데이터 없음 표시
     t04 = next(x for x in mid["rows"] if x["ticker"] == "T04")
     assert t04["since"] == date(2026, 8, 14) and t04["since_cut"] and abs(t04["ret_hold"] - 0.10) < 1e-12
@@ -87,14 +91,18 @@ def test_basket_state_between_and_on_rebalance_day():
     names = [x["ticker"] for x in reb["rows"]]
     assert {"T05", "T06"} <= set(names) and not {"T00", "T03"} & set(names)
     out = {t: why for t, why, _ in reb["out"]}
-    assert out["T00"].startswith("점수 50") and out["T03"] == "규칙상 매도"
+    assert out["T00"].startswith("점수 50") and out["T03"] == "규칙상 매도 (9/16 현금화)"
     meta = {"mode": "normal", "failed": []}
     reps = _reports("2026-09-30")
     assert "바구니 교체 +2 −2" in make_subject(reps, meta)
     assert "🧺 바구니" in render_html(reps, meta) and "제외 T03: 규칙상 매도" in render_text(reps, meta)
-    assert abs(reb["month_ret"] - 0.02) < 1e-12 and "지난 바구니 수익률 (9/15 → 9/30 종가): +2.0%" in render_text(reps, meta)
+    assert abs(reb["month_ret"] - (0.02 - sell_cost)) < 1e-12
+    assert "지난 바구니 수익률 (9/15 → 9/30 종가): +2.0%" in render_text(reps, meta)
     assert "이번 기간 수익률 (9/15 종가 → 9/29 종가): +2.0%" in render_text(_reports("2026-09-29"), meta)
-    assert "T04 20.0% · 점수 83 → 오늘 86 · 편입 후 +10.0% (~8/14~)" in render_text(_reports("2026-09-29"), meta)
+    text29 = render_text(_reports("2026-09-29"), meta)
+    assert "T04 20.0% · 점수 83 → 오늘 86 · 편입 후 +10.0% (~8/14~)" in text29
+    assert "T03 20.0% · 점수 86 → 오늘 87 · 🔻 9/16 규칙 매도 → 현금 · 매도까지 +0.0%" in text29
+    assert "현금 0% → 교체 사이 매도 뒤 20%" in text29
     # 교체일: 유지 종목은 편입 후, 제외 종목은 보유 기간 수익률, 신규는 표시만
     t04r = next(x for x in reb["rows"] if x["ticker"] == "T04")
     assert t04r["since"] == date(2026, 8, 14)
@@ -119,3 +127,65 @@ def test_basket_ytd_compounds_with_costs():
     assert y["start"] == date(2025, 12, 31) and y["trades"] == 18
     assert 0.0185 < y["ret"] < 0.0195 and abs(y["bench_ret"] - 0.10) < 1e-12
     assert "올해 누적 수익률 (12/31 → 9/29 종가, 교체 18회): +1.9% · 같은 기간 SPY +10.0%" in render_text(reps, {"mode": "normal", "failed": []})
+
+
+def test_mail_simulation_matches_backtest_with_mid_exit_and_cash():
+    """메일의 바구니 계산(_simulate)과 검증 엔진(Book.run mid_exit·rf)이 같은 값을 내는지."""
+    from scoring.checklist import TickerReport, _simulate
+    from scoring.market_calendar import is_trading_day
+    spec = importlib.util.spec_from_file_location("eval_topk", Path(__file__).parents[1] / "scripts" / "eval_topk.py")
+    et = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(et)
+    idx = pd.DatetimeIndex([d for d in pd.bdate_range("2026-01-15", "2026-06-30") if is_trading_day(d.date())])
+    rng = np.random.default_rng(3)
+    cols = [f"T{i:02d}" for i in range(9)]
+    C = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0.0005, 0.02, (len(idx), 9)), axis=0)), index=idx, columns=cols)
+    S = pd.DataFrame(rng.choice([55, 62.5, 75, 83.3, 91.7], size=(len(idx), 9)), index=idx, columns=cols)
+    H = pd.DataFrame((rng.random((len(idx), 9)) > 0.15).astype(float), index=idx, columns=cols)
+    rf = pd.Series(0.04 / 252, index=idx)
+    reps = [TickerReport(ticker=t, name="", group="", date=idx[-1], close=float(C[t].iloc[-1]), change=0.0, from_high=0.0,
+                         checks=[], sig={"hist": pd.DataFrame({"score_s": S[t], "state": H[t], "close": C[t]})})
+            for t in cols]
+    sim = _simulate(reps, idx[0].date(), idx[-1].date(), rf)
+    rfa = rf.to_numpy().copy()
+    rfa[0] = 0.0   # 엔진은 첫날 현금으로 시작해 그날 이자가 붙는다 — 메일 계산은 첫날 종가에 바구니를 짠 뒤부터
+    out, _, _ = et.Book(S, C, H).run(60, 5, -1, True, mid_exit=True, rf=rfa)
+    assert sim["sells"] and abs(sim["value"] - float((1 + out).prod())) < 1e-12
+
+
+def test_subject_and_cash_interest():
+    from scoring.checklist import TickerReport, basket_ytd, make_subject
+    # 9/16: T03 이 교체 다음 날 규칙 매도 → 제목에 '바구니 매도'
+    assert "바구니 매도 T03" in make_subject(_reports("2026-09-16"), {"mode": "normal", "failed": []})
+    # 후보가 없으면 전부 현금 → 올해 수익률 = 단기금리 복리
+    idx = pd.bdate_range("2025-12-01", "2026-03-31")
+    hist = pd.DataFrame({"score_s": 30.0, "state": 0.0, "close": 100.0}, index=idx)
+    rep = TickerReport(ticker="T00", name="", group="", date=idx[-1], close=100.0, change=0.0, from_high=0.0, checks=[],
+                       sig={"hist": hist})
+    rf = pd.Series(0.0002, index=idx)
+    y = basket_ytd([rep], date(2026, 3, 31), rf=rf)
+    days = ((idx > "2025-12-31") & (idx <= "2026-03-31")).sum()
+    assert abs(y["ret"] - (1.0002 ** days - 1)) < 1e-12
+
+
+def test_sold_then_rebought_restarts_entry():
+    """교체 사이에 팔았다가 다음 교체일에 다시 들어온 종목은 편입일이 그 교체일 (편입 후 0%)."""
+    from scoring.checklist import TickerReport, basket_state
+    idx = pd.bdate_range("2026-08-03", "2026-09-30")
+    reps = []
+    for i in range(5):
+        state = np.ones(len(idx))
+        close = np.full(len(idx), 100.0)
+        if i == 0:   # 9/16~9/22 규칙 매도 구간, 그 사이 가격 −10%, 9/23 부터 다시 보유
+            state[(idx >= "2026-09-16") & (idx <= "2026-09-22")] = 0.0
+            close[idx >= "2026-09-17"] = 90.0
+        hist = pd.DataFrame({"score_s": 90.0 - i, "state": state, "close": close}, index=idx)
+        sig = {"score": 90.0, "score_s": 90.0 - i, "prev_score_s": 90.0, "proj": 90.0, "held": True, "event": "",
+               "blocked": "", "stop": 95.0, "close": close[-1], "above200": True, "ma200": 90.0, "overheat": False,
+               "highvol": False, "recent": [], "hist": hist}
+        reps.append(TickerReport(ticker=f"T{i:02d}", name="", group="", date=idx[-1], close=close[-1], change=0.0,
+                                 from_high=0.0, checks=[], sig=sig))
+    b = basket_state(reps)
+    t0 = next(x for x in b["rows"] if x["ticker"] == "T00")
+    assert b["rebalance"] and t0["since"] == date(2026, 9, 30) and abs(t0["ret_hold"]) < 1e-12
+    assert abs(t0["ret"]) < 1e-12          # 지난 기간: 9/16 종가(100)에 팔아 손실 없음

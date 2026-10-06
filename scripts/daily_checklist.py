@@ -30,7 +30,9 @@ sys.path.insert(0, str(ROOT))
 from scoring import get_profile  # noqa: E402
 from scoring.checklist import (build_with_history, make_subject, render_html, render_markdown,  # noqa: E402
                                render_text)
-from scoring.extras import calendar_note, earnings_dates, fmt_day, fx_summary, upcoming  # noqa: E402
+from scoring.bigtech import BENCH, compute_members, load_members, load_watchlist, membership_year, save_members  # noqa: E402
+from scoring.bigtech import GROUP as BIGTECH  # noqa: E402
+from scoring.extras import calendar_note, earnings_dates, fmt_day, fx_summary, tbill_daily, upcoming  # noqa: E402
 from scoring.market_calendar import session_status  # noqa: E402
 from scoring.sources import fetch_fdr, load_prices  # noqa: E402
 
@@ -51,10 +53,27 @@ def main() -> None:
     now = datetime.fromisoformat(args.now) if args.now else None
     status = session_status(now)
 
+    notes: list[str] = []
+    extra: list[str] = []
     if args.tickers:
         wl = pd.DataFrame({"group": "", "ticker": args.tickers, "name": "", "bench": "SPY"})
     else:
-        wl = pd.read_csv(args.watchlist, dtype=str).fillna("")
+        # 빅테크 칸: 그날 기준 나스닥 거래대금 상위 10 (scoring/bigtech.py). 새해 목록이 없으면 여기서 계산
+        members = load_members()
+        need = membership_year(status["target"])
+        if need not in members:
+            if args.no_extras:
+                notes.append(f"빅테크 칸 {need}년 목록이 config/bigtech.csv 에 없어 지난 목록을 그대로 씀 "
+                             "— scripts/update_bigtech.py 실행 후 커밋 필요")
+            else:
+                ranked = compute_members(need, lambda t, s: load_prices(f"fdr:{t}", s))
+                save_members({need: ranked})
+                members = load_members()
+                notes.append(f"빅테크 칸 {need}년 목록을 새로 계산함 ({', '.join(ranked.index)}) "
+                             "— config/bigtech.csv 커밋 필요")
+        wl = load_watchlist(args.watchlist, status["target"], members)
+        # 지난해 빅테크 칸 종목은 메일 표에는 빼고 바구니 지난 기간 계산에만 쓴다
+        extra = [t for t in members.get(need - 1, []) if t not in set(wl["ticker"])]
     if "bench" not in wl.columns:
         wl["bench"] = ""
     start = (pd.Timestamp.today() - pd.DateOffset(years=args.years)).strftime("%Y-%m-%d")
@@ -85,6 +104,14 @@ def main() -> None:
     if not reports:
         print("데이터를 하나도 불러오지 못했습니다:\n" + "\n".join(failed))
         sys.exit(1)
+    basket_extra = []
+    for t in extra:
+        try:
+            df = load_prices(args.source.format(t=t), start).loc[:cut]
+            basket_extra.append(build_with_history(df, get_profile(t), t, t, BIGTECH, expected=status["target"],
+                                                   bench=bench_for(BENCH, t)))
+        except Exception:
+            pass
 
     latest = max(r.date for r in reports).date()
     if status["holiday"]:
@@ -96,7 +123,9 @@ def main() -> None:
         mode = "delayed"
     else:
         mode = "normal"
-    meta = {"mode": mode, "failed": failed, **{k: str(v) if v else v for k, v in status.items()}}
+    meta = {"mode": mode, "failed": failed, "notes": notes, **{k: str(v) if v else v for k, v in status.items()}}
+    meta["basket_extra"] = basket_extra
+    meta["rf"] = None if args.no_extras else tbill_daily(start)
     ev_from = status["next_open"]  # 일정은 다음 거래일부터
     if not args.no_extras:
         try:
@@ -124,7 +153,8 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
         (d / "subject.txt").write_text(subject + "\n", encoding="utf-8")
         (d / "body.txt").write_text(render_text(reports, meta) + "\n", encoding="utf-8")
-        (d / "meta.json").write_text(json.dumps({**meta, "latest": str(latest), "subject": subject},
+        plain = {k: v for k, v in meta.items() if k not in ("basket_extra", "rf")}
+        (d / "meta.json").write_text(json.dumps({**plain, "latest": str(latest), "subject": subject},
                                                 ensure_ascii=False, indent=2), encoding="utf-8")
     if args.out_md:
         outputs["md"] = Path(args.out_md)

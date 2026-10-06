@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scoring import get_profile  # noqa: E402
+from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.score import compute_indicators  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
 
@@ -79,7 +80,7 @@ def main() -> None:
     ap.add_argument("--md", help="결과 마크다운 저장")
     args = ap.parse_args()
     end = pd.Timestamp(args.asof)
-    wl = pd.read_csv(args.watchlist, dtype=str).fillna("")
+    wl = load_watchlist(args.watchlist)
     grp = dict(zip(wl["ticker"], wl["group"]))
 
     rows = []

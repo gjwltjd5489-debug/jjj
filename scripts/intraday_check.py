@@ -22,6 +22,7 @@ from scoring import get_profile  # noqa: E402
 from scoring.extras import earnings_dates, fmt_day, upcoming  # noqa: E402
 from scoring.intraday import check_ticker, make_subject, render_html, render_text  # noqa: E402
 from scoring.market_calendar import NY, holiday_name, is_trading_day  # noqa: E402
+from scoring.bigtech import load_watchlist  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
 
 OPEN = time(9, 30)
@@ -48,7 +49,7 @@ def main() -> None:
         meta["holiday"] = holiday_name(today) or "주말"
     else:
         wl = (pd.DataFrame({"group": "", "ticker": args.tickers, "name": "", "bench": "SPY"}) if args.tickers
-              else pd.read_csv(args.watchlist, dtype=str).fillna(""))
+              else load_watchlist(args.watchlist, today))
         start = (pd.Timestamp(today) - pd.DateOffset(years=args.years)).strftime("%Y-%m-%d")
         cache: dict[str, pd.DataFrame] = {}
 

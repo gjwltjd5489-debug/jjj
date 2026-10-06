@@ -15,7 +15,7 @@ QQQ 기준으로 시작했고, 종목별 프로파일로 확장할 수 있다. *
 | [docs/checklist_score.md](docs/checklist_score.md) | 체크리스트 점수(성향 색으로 계산)와 매수·매도 규칙, 27종목 검증 |
 | [docs/mails.md](docs/mails.md) | 아침 체크리스트·장초반 확인 메일 구성, 일정 파일 관리 |
 | [docs/signal_review.md](docs/signal_review.md) | 최근 1년 매수·매도 신호 사후 점검, 원인 분석, 보완 규칙 20년 검증 |
-| [docs/topk.md](docs/topk.md) | 점수 상위 k개 동일가중 보유 전략 (n·k·리밸런싱 주기, 무작위 선택과 비교) |
+| [docs/topk.md](docs/topk.md) | 점수 상위 k개 동일가중 보유 전략 (n·k·리밸런싱 주기, 무작위 선택과 비교), 빅테크 칸(나스닥 거래대금 상위 10)·교체 사이 매도 |
 | [docs/events.md](docs/events.md) | 기술적 이벤트(이평 돌파·MACD·RSI 등) 뒤 수익률 검증, 메일의 단기 반등 후보 근거 |
 
 ## 설치
@@ -64,6 +64,7 @@ python scripts/rotate_basket.py --demo     # 인터넷 없이 대용 데이터�
 - `scoring/evaluate.py` — 구간별 이후 수익률, 순위상관(IC), 이벤트 전략 성과
 - `scoring/basket.py` — 후보 유니버스, 수익률·점수 상관, 저상관 종목 선정
 - `scoring/portfolio.py` — 상위 n 로테이션 백테스트, 동일가중 비교
+- `scoring/bigtech.py` — 빅테크 칸: 해마다 나스닥 거래대금 상위 10 (`config/bigtech.csv`, `scripts/update_bigtech.py`)
 - `scoring/sources.py`, `scoring/data.py` — CSV / FinanceDataReader / 샘플 데이터 로더
 
 ## 새 카드 만들기

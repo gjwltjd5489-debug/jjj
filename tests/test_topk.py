@@ -331,3 +331,20 @@ def test_ytd_compares_qqq_and_60_40():
     assert "SPY 60 · AGG 40" in render_html(reps, meta)
     # 채권 가격이 없으면 60/40 은 빼고 SPY · QQQ 만
     assert [n for n, _ in basket_ytd(reps, date(2026, 9, 29))["cmp"]] == ["SPY", "QQQ"]
+
+
+def test_basket_today_change():
+    """바구니 표의 '오늘 등락': 종목별 전일 대비, 이미 판 종목은 비움, 바구니 전체 오늘 등락도 계산."""
+    from scoring.checklist import basket_state, render_html, render_text
+    b = basket_state(_reports("2026-09-16"))                 # 9/16: T04 +10%, T03 은 오늘 규칙 매도 신호
+    day = {x["ticker"]: x["day"] for x in b["rows"]}
+    assert day["T04"] == pytest.approx(0.10) and day["T00"] == 0.0 and day["T03"] == 0.0   # 오늘까지는 들고 있었다
+    assert b["day_ret"] == pytest.approx(0.02 - 0.2 / 1.02 * 0.0005)
+    later = basket_state(_reports("2026-09-29"))
+    t03 = next(x for x in later["rows"] if x["ticker"] == "T03")
+    assert t03["sold"] == date(2026, 9, 16) and pd.isna(t03["day"])     # 9/16 에 판 종목은 오늘 등락 없음
+    meta = {"mode": "normal", "failed": []}
+    text = render_text(_reports("2026-09-16"), meta)
+    assert "T04 20.0% · 점수 83 → 오늘 86 · 편입 후 +10.0% (~8/14~) · 오늘 +10.0%" in text
+    assert "이번 기간 수익률 (9/15 종가 → 9/16 종가): +2.0% · 오늘 +2.0%" in text
+    assert "<th class='s'>오늘<br>등락</th>" in render_html(_reports("2026-09-16"), meta)

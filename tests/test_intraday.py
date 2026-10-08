@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -98,3 +99,62 @@ def test_table_keeps_alerts_and_holdings_and_summarises_rest():
     assert "해당 없음: 아침 신호 재확인" in text and "나머지 1종목" in text and "FOMC" in text
     calm = render_html([mk("Q", quiet, quiet)], meta)
     assert "특이사항 없음" in calm
+
+
+def _live(ticker, move, name="", notes=()):
+    r = IntradayRow(ticker, name, "", True, 100.0, 100.0, 100.0 * (1 + move), 0.0, move, 0.01, dict(BASE), dict(BASE))
+    r.notes = list(notes)
+    return r
+
+
+def _morning(**ov):
+    """아침 메일 바구니(checklist.basket_state 결과)의 필요한 부분만."""
+    from datetime import date
+    return {"base": date(2026, 9, 30), "today": date(2026, 10, 5), "rebalance": False, "next": date(2026, 10, 15),
+            "rows": [{"ticker": "AAA", "ret_hold": 0.10, "since": date(2026, 9, 15), "since_cut": False},
+                     {"ticker": "BBB", "ret_hold": 0.0, "since": date(2026, 9, 30), "since_cut": False}],
+            "w_now": {"AAA": 0.5, "BBB": 0.3}, "cash_now": 0.1, "sold_today": [], "month_ret": 0.02,
+            "ytd": {"ret": 0.20}, "ov": {"dist": -0.05, "risk_off": False, "qld": True, "q_now": 0.0, "q_ret": float("nan"),
+                                         "cq": 0.0, "blocked": False, "t0": None, "today": [], **ov}}
+
+
+def test_basket_live_today_period_and_flags():
+    from datetime import date
+    from scoring.intraday import basket_live
+    rows = [_live("AAA", 0.02, notes=[("near_sell", "x")]), _live("BBB", -0.01), _live("SPY", 0.005), _live("QQQ", 0.01)]
+    spy_prev = pd.Series(100.0, index=pd.bdate_range("2025-01-01", periods=250))
+    bl = basket_live(_morning(), rows, spy_prev, None, date(2026, 10, 6))
+    # 오늘 = 0.5 × 2% + 0.3 × (−1%) = +0.7%, 이번 기간 = (1.02)(1.007) − 1, 올해 = (1.2)(1.007) − 1
+    assert bl["today"] == pytest.approx(0.007) and bl["period"] == pytest.approx(1.02 * 1.007 - 1)
+    assert bl["ytd"] == pytest.approx(1.2 * 1.007 - 1)
+    aaa = bl["hold"][0]
+    assert aaa["ret_hold"] == pytest.approx(1.1 * 1.02 - 1) and aaa["flags"] == ["↘ 퇴출 근접"]
+    assert bl["signals"] == [] and bl["dist"] < 0
+    meta = {"mode": "normal", "date": "2026-10-06", "time": "10:03", "minutes": 33, "holiday": None, "basket": bl}
+    assert make_subject(rows, meta).startswith("[장초반 확인] 2026-10-06 10:03 ET · 바구니 +0.7%")
+    text = render_text(rows, meta)
+    assert "바구니 오늘 +0.7% (같은 시각 SPY +0.5% · QQQ +1.0%) · 이번 기간 +2.7% (9/30 종가 → 지금) · 올해 +20.8%" in text
+    assert "AAA 50.0% · 지금 102.00 (+2.0%) · 편입 후 +12.2% (9/15~) · ↘ 퇴출 근접" in text
+    assert "🧺 바구니 현재 상황" in render_html(rows, meta)
+
+
+def test_basket_live_signals_filter_dip_buy_exit_and_stop():
+    from datetime import date
+    from scoring.intraday import basket_live
+    spy_prev = pd.Series(100.0, index=pd.bdate_range("2025-01-01", periods=250))
+    # 어제는 200일선 위 → 지금 SPY −12%: 종가가 이대로면 필터 이탈 + QLD 10% 매수
+    rows = [_live("AAA", 0.0), _live("BBB", 0.0), _live("SPY", -0.12)]
+    bl = basket_live(_morning(), rows, spy_prev, None, date(2026, 10, 6))
+    assert [k for k, _ in bl["signals"]] == ["filter", "dip_buy"] and "QLD 10% 매수 신호" in bl["signals"][1][1]
+    meta = {"mode": "normal", "date": "2026-10-06", "time": "10:03", "minutes": 33, "holiday": None, "basket": bl}
+    assert "SPY 200일선 이탈 후보 · QLD 매수 후보" in make_subject(rows, meta)
+    # QLD 10% 보유(매수가 대비 −20%) 중 SPY 가 200일선 위로 + QLD −7% → 청산 신호, 매수가 대비 −25.6% 라 손절도
+    held = _morning(dist=0.08, risk_off=True, q_now=0.10, q_ret=-0.20, cq=0.10)
+    bl = basket_live(held, [_live("AAA", 0.0), _live("BBB", 0.0), _live("SPY", 0.01)], spy_prev, -0.07, date(2026, 10, 6))
+    assert [k for k, _ in bl["signals"]] == ["dip_exit", "dip_stop"]
+    assert bl["qld"]["ret"] == pytest.approx(0.8 * 0.93 - 1) and bl["today"] == pytest.approx(0.10 * -0.07)
+    # 이미 단계만큼 산 상태(10%)면 −12% 에서 추가 매수 신호 없음, 손절 뒤 쉬는 중이면 매수 신호 없음
+    assert "dip_buy" not in [k for k, _ in basket_live(_morning(cq=0.10, q_now=0.1, q_ret=0.0, risk_off=True, dist=0.11),
+                                                      rows, spy_prev, 0.0, date(2026, 10, 6))["signals"]]
+    assert basket_live(_morning(blocked=True, risk_off=True, dist=0.11), rows, spy_prev, None,
+                       date(2026, 10, 6))["signals"] == []

@@ -7,6 +7,8 @@
   참고로 신호 난 날 종가에 거래했다고 본 값도 함께 적는다 (이전 문서의 기준).
 교체일 운을 덜기 위해 교체일을 0~4거래일 밀어 5번 돌린 평균을 쓴다 (괄호: 5번 중 최저~최고).
 샤프 = (일간 수익 − 단기국채 금리) 평균 ÷ 일간 수익 표준편차 × √252.
+상장 전 구간: scoring/backfill.py 로 지수·선물·펀드를 이어 붙인다 (은·달러·하이일드·초장기채·중국·인도·원자재·
+매니지드 퓨처스, --no-backfill 이면 PDBC 만 DBC 로). 비트코인(IBIT)은 잇지 않는다.
 QLD: 실제 가격 (2006-06 상장 전은 2 × QQQ − 연 0.95% − 단기금리로 합성, 그 구간은 시가 없이 하루 수익을 장중에).
 데이터: 시가=고가=저가=종가인 채로 하루 ±25% 넘게 튀었다가 다음 날 제자리로 오는 잘못된 가격(CPER 2014-12-04,
 2015-02-02)은 전일 값으로 고친다 (clean_spikes).
@@ -31,8 +33,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import eval_topk as et  # noqa: E402
 from eval_bigtech import tbill  # noqa: E402
 from scoring import get_profile  # noqa: E402
+from scoring.backfill import PROXY, checklist_score_bf, load_backfilled  # noqa: E402
 from scoring.bigtech import BENCH, GROUP, load_members  # noqa: E402
-from scoring.checklist_score import checklist_score  # noqa: E402
 from scoring.sources import load_prices  # noqa: E402
 from scoring.topk import BASKET_EXCLUDE, BASKET_K, BASKET_N, DIP_TICKER, EQUITY_GROUPS  # noqa: E402
 
@@ -64,6 +66,7 @@ def main() -> None:
     ap.add_argument("--watchlist", default=str(ROOT / "config" / "watchlist.csv"))
     ap.add_argument("--asof", default="2026-10-02")
     ap.add_argument("--md", help="결과 마크다운 저장")
+    ap.add_argument("--no-backfill", action="store_true", help="상장 전 구간을 잇지 않음 (PDBC 만 DBC 로)")
     args = ap.parse_args()
     end = pd.Timestamp(args.asof)
     A = end - pd.DateOffset(years=1) + pd.Timedelta(days=1)
@@ -78,11 +81,13 @@ def main() -> None:
 
     def prices(t: str) -> pd.DataFrame:
         if t not in cache:
-            cache[t] = clean_spikes(load_prices(f"fdr:{et.BACKFILL.get(t, t)}", "2004-01-01").loc[:end])
+            df = (load_prices(f"fdr:{et.BACKFILL.get(t, t)}", "2004-01-01") if args.no_backfill
+                  else load_backfilled(t, "2004-01-01"))
+            cache[t] = clean_spikes(df.loc[:end])
         return cache[t]
     S, C, H = {}, {}, {}
     for t, b in [(r.ticker, r.bench) for r in etf.itertuples(index=False)] + [(t, BENCH) for t in stocks]:
-        o = checklist_score(prices(t), get_profile(t), prices(b)["Close"] if b else None)
+        o = checklist_score_bf(prices(t), get_profile(t), prices(b)["Close"] if b else None)
         S[t], C[t], H[t] = o["score_s"], o["close"], o["state"]
         print(f"{t} 완료", file=sys.stderr)
     S = pd.DataFrame(S).loc["2005-06-01":]
@@ -142,6 +147,8 @@ def main() -> None:
     out(f"# 바구니 운용 검증: 후보 제외 · SPY 200일선 필터 · QLD 하락 매수 (~{end.date()})\n")
     out(f"바구니 = 규칙상 보유 · {BASKET_N:g}점 이상 상위 {BASKET_K}개 · 15일·월말 교체 · 교체 사이 규칙 매도 · 현금 이자. "
         "신호는 그날 종가, 체결은 다음 날 시가. 교체일을 0~4거래일 민 5번의 평균 (괄호: 최저~최고).\n")
+    out("상장 전 구간: " + ("PDBC 만 DBC 로 이음" if args.no_backfill else
+                       " · ".join(f"{t} ← {v[3]}" for t, v in PROXY.items())) + "\n")
     rows, eps = [], None
     for name, kw, at_open in variants:
         rs = []

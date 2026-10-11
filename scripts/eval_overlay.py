@@ -1,7 +1,7 @@
-"""바구니 운용 검증 (실제 데이터): 중복 종목 제거 · SPY 200일선 필터 · QLD 하락 매수 (docs/topk.md 8장).
+"""바구니 운용 검증 (실제 데이터): 후보 제외(중복 종목·구리) · SPY 200일선 필터 · QLD 하락 매수 (docs/topk.md 8장).
 
 - ① 이전 메일: 나스닥 거래대금 상위 10 · 교체 사이 매도 · 현금 이자 (7장)
-- ② ① + IWM·VTV·SCHD 제외 + SPY 200일선 아래면 주식 종목 절반 (교체일, 그리고 교체 사이 처음 내려간 날)
+- ② ① + IWM·VTV·SCHD·CPER 제외 + SPY 200일선 아래면 주식 종목 절반 (교체일, 그리고 교체 사이 처음 내려간 날)
 - ③ ② + QLD 하락 매수 (지금 메일, scoring/topk.py)
 체결: 신호는 그날 종가로 보고, 다음 날 시가에 거래한다 (메일을 아침에 보고 장 시작에 주문). 배당 조정 시가·종가.
   참고로 신호 난 날 종가에 거래했다고 본 값도 함께 적는다 (이전 문서의 기준).
@@ -131,7 +131,7 @@ def main() -> None:
 
     full = dict(exclude=exclude, equity=equity, dist=dist, rq=rq)
     variants = [("① 이전 메일 (7장)", {}, True),
-                ("② ① + 중복 제거 + SPY 200일선 필터", dict(exclude=exclude, equity=equity, dist=dist), True),
+                ("② ① + 후보 제외 + SPY 200일선 필터", dict(exclude=exclude, equity=equity, dist=dist), True),
                 ("**③ ② + QLD 하락 매수 (지금 메일)**", full, True),
                 ("참고: ③ 을 신호 난 날 종가에 거래했다고 보면", full, False)]
     lines: list[str] = []
@@ -139,7 +139,7 @@ def main() -> None:
     def out(s: str = "") -> None:
         print(s)
         lines.append(s)
-    out(f"# 바구니 운용 검증: 중복 제거 · SPY 200일선 필터 · QLD 하락 매수 (~{end.date()})\n")
+    out(f"# 바구니 운용 검증: 후보 제외 · SPY 200일선 필터 · QLD 하락 매수 (~{end.date()})\n")
     out(f"바구니 = 규칙상 보유 · {BASKET_N:g}점 이상 상위 {BASKET_K}개 · 15일·월말 교체 · 교체 사이 규칙 매도 · 현금 이자. "
         "신호는 그날 종가, 체결은 다음 날 시가. 교체일을 0~4거래일 민 5번의 평균 (괄호: 최저~최고).\n")
     rows, eps = [], None

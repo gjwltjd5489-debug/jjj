@@ -18,7 +18,7 @@ from .profiles import Profile
 from .checklist_score import RULE, checklist_score, points_from_verdicts
 from .indicators import rolling_pct_rank
 from .bigtech import eligible
-from .topk import (BASKET_EXCLUDE, BASKET_K, BASKET_N, DIP_CAP, DIP_SIZE, DIP_STEP, DIP_STOP, DIP_TICKER,
+from .topk import (BASKET_EXCLUDE, EXCLUDE_WHY, BASKET_K, BASKET_N, DIP_CAP, DIP_SIZE, DIP_STEP, DIP_STOP, DIP_TICKER,
                    EQUITY_GROUPS, MOM_DAYS, RISK_OFF_CUT, basket_weights, dip_target, month_end, next_rebalance,
                    prev_rebalance, rebalance_days, trim_bottom)
 from .score import compute_indicators
@@ -424,7 +424,8 @@ def holdings(reports: list[TickerReport]) -> list[TickerReport]:
 
 BASKET_RULE = (f"규칙상 보유 종목 중 3일 평균 {BASKET_N:g}점 이상 상위 {BASKET_K}개를 {100 / BASKET_K:g}%씩, "
                "매월 15일(휴장이면 직전 거래일)·마지막 거래일 종가 기준으로 교체 (점수가 같으면 최근 60거래일 수익률 순, "
-               f"{'·'.join(BASKET_EXCLUDE)}는 다른 주식 종목과 겹쳐 제외). 교체 사이에 규칙 매도 신호가 나면 바로 팔아 현금. "
+               f"{'·'.join(t for t in BASKET_EXCLUDE if t not in EXCLUDE_WHY)}는 다른 주식 종목과 겹쳐, "
+               f"{'·'.join(f'{t}는 {w}' for t, w in EXCLUDE_WHY.items())} 제외). 교체 사이에 규칙 매도 신호가 나면 바로 팔아 현금. "
                f"SPY가 200일선 아래면 주식 종목은 절반({100 / BASKET_K * RISK_OFF_CUT:g}%). "
                f"SPY가 200일선보다 {DIP_STEP:.0%} 아래면 {DIP_TICKER} {DIP_SIZE:.0%}, {DIP_STEP:.0%} 더 내려갈 때마다 "
                f"{DIP_SIZE:.0%}씩 (최대 {DIP_CAP:.0%}, 현금부터 쓰고 모자라면 하위 종목부터 줄임) · 200일선 회복 시 전량 매도 · "
@@ -817,7 +818,7 @@ def basket_state(reports: list[TickerReport], rf: pd.Series | None = None, ov: d
         if t in sold:
             why = f"규칙상 매도 ({_md(sold[t])} 현금화)"
         elif t in BASKET_EXCLUDE:
-            why = "다른 주식 종목과 겹쳐 바구니 후보에서 뺌"
+            why = f"{EXCLUDE_WHY.get(t, '다른 주식 종목과 겹쳐')} 바구니 후보에서 뺌"
         elif not eligible(t, base):
             why = "빅테크 칸에서 빠짐"
         elif not hd.get(t):

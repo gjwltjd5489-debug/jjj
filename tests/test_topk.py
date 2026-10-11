@@ -22,8 +22,9 @@ def test_basket_weights_top_k_ties_and_cash():
     assert len(w) == 5 and "SOXX" in w and "NVDA" not in w and all(v == 0.2 for v in w.values())
     w = basket_weights(sc, held, n=60, k=10)             # 후보 4개 → 10%씩, 현금 60%
     assert set(w) == {"A", "B", "C", "D"} and abs(sum(w.values()) - 0.4) < 1e-12
-    # 중복 제거: IWM·VTV·SCHD 는 점수가 높아도 후보에서 빠진다
-    w = basket_weights({**sc, "IWM": 100.0, "VTV": 99.0}, {**held, "IWM": True, "VTV": True}, n=60, k=2)
+    # 후보 제외: IWM·VTV·SCHD(중복)·CPER(구리) 는 점수가 높아도 후보에서 빠진다
+    w = basket_weights({**sc, "IWM": 100.0, "VTV": 99.0, "CPER": 98.0},
+                       {**held, "IWM": True, "VTV": True, "CPER": True}, n=60, k=2)
     assert w == {"A": 0.5, "B": 0.5}
 
 

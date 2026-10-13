@@ -29,6 +29,8 @@ from scoring.news import KST, URL, instructions, window  # noqa: E402
 
 API_MAX = 2_000_000   # api.json 최대 글자 수
 LINK_MIN = 8          # 이보다 짧은 링크 글자(메뉴·버튼)는 버린다
+CHALLENGE = re.compile(r"Just a moment|보안 확인 수행 중|Enable JavaScript and cookies|Verify you are human|사람인지 확인")
+CHALLENGE_WAIT = 30   # 봇 확인 화면이 풀리기를 기다리는 초
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/141.0 Safari/537.36")
 
@@ -51,6 +53,10 @@ def fetch_browser(url: str, scrolls: int) -> tuple[str, list, list]:
                                 viewport={"width": 1280, "height": 2000})
         page.on("response", keep)
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        for _ in range(CHALLENGE_WAIT):   # 자동으로 풀리는 확인 화면이면 기다린다 (풀리지 않으면 아래에서 실패 처리)
+            if not CHALLENGE.search(page.title() + page.inner_text("body")[:2000]):
+                break
+            page.wait_for_timeout(1_000)
         try:
             page.wait_for_load_state("networkidle", timeout=20_000)
         except Exception:  # noqa: BLE001 - 계속 연결을 여는 사이트도 있다
@@ -133,6 +139,10 @@ def main() -> None:
         try:
             text, found, links = fn()
             meta["method"] = name
+            if CHALLENGE.search(text[:3000]):
+                errors.append(f"{name}: Cloudflare 봇 확인 화면에서 막힘")
+                text, found, links = "", [], []
+                continue
             if len(text.strip()) >= 200:
                 break
             errors.append(f"{name}: 글자 {len(text.strip())}자뿐")
@@ -142,9 +152,12 @@ def main() -> None:
     meta.update(status="ok" if ok else "fail", chars=len(text), api=len(found))
     if not ok:
         detail = " / ".join(errors) or "내용 없음"
-        blocked = re.search(r"403|TUNNEL_CONNECTION_FAILED|Tunnel connection failed", detail)
-        meta["error"] = ("사이트 접속 차단 (루틴 환경의 네트워크 허용 도메인에 www.saveticker.com 추가 필요)"
-                         if blocked else detail)
+        if "봇 확인" in detail:
+            meta["error"] = "사이트의 Cloudflare 봇 확인을 통과하지 못함"
+        elif re.search(r"403|TUNNEL_CONNECTION_FAILED|Tunnel connection failed", detail):
+            meta["error"] = "사이트 접속 차단 (루틴 환경의 네트워크 허용 도메인에 www.saveticker.com 추가 필요)"
+        else:
+            meta["error"] = detail
         meta["detail"] = detail
 
     api = json.dumps(found, ensure_ascii=False)

@@ -1,22 +1,24 @@
-"""메일 아래에 붙이는 주요 뉴스 (saveticker.com/news).
+"""메일 아래에 붙이는 주요 뉴스 (언론사 RSS, config/news_feeds.csv).
 
 - 아침 메일: 직전 장초반 메일(뉴욕 10:03) 뒤부터 지금까지
 - 장초반 메일: 직전 아침 메일(서울 06:00) 뒤부터 지금까지
-- 뉴스 고르기·요약은 루틴(Claude)이 instructions.txt 를 따라 news.json 으로 쓰고,
-  이 모듈이 그 파일을 메일 HTML·텍스트 맨 아래에 붙인다.
+- RSS 를 받아 구간 안 기사만 남기는 것은 이 모듈이, 중요한 뉴스 고르기·요약은
+  루틴(Claude)이 instructions.txt 를 따라 news.json 으로 쓰고, 이 모듈이 그 파일을 메일 맨 아래에 붙인다.
 """
 
 from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, time, timedelta
+import re
+import xml.etree.ElementTree as ET_XML
+from datetime import datetime, time, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
 ET = ZoneInfo("America/New_York")
-URL = "https://www.saveticker.com/news"
 MARK = "<!--news-->"
 TEXT_MARK = "─" * 20   # 텍스트 본문의 뉴스 구역 시작 줄
 
@@ -47,6 +49,57 @@ def window(kind: str, now: datetime) -> tuple[datetime, datetime]:
     return last_run(OTHER[kind], now), now
 
 
+def _date(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        t = parsedate_to_datetime(text)          # RSS: "Tue, 13 Oct 2026 05:12:00 GMT"
+    except (TypeError, ValueError):
+        try:
+            t = datetime.fromisoformat(text.replace("Z", "+00:00"))   # Atom: ISO 8601
+        except ValueError:
+            return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _plain(text: str | None, n: int = 300) -> str:
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n].rstrip() + "…"
+
+
+def parse_feed(xml: str | bytes, source: str) -> list[dict]:
+    """RSS 2.0 / Atom 을 [{time, source, title, desc, url}] 로. 시각이 없는 기사는 time None."""
+    root = ET_XML.fromstring(xml)
+    for el in root.iter():                       # 네임스페이스 떼기
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+    out = []
+    for it in list(root.iter("item")) + list(root.iter("entry")):
+        link = it.findtext("link") or ""
+        if not link.strip():
+            link = next((l.get("href", "") for l in it.findall("link") if l.get("rel", "alternate") == "alternate"), "")
+        when = _date(it.findtext("pubDate") or it.findtext("published") or it.findtext("updated")
+                     or it.findtext("date"))
+        out.append({"time": when, "source": source, "title": _plain(it.findtext("title"), 200),
+                    "desc": _plain(it.findtext("description") or it.findtext("summary") or it.findtext("content")),
+                    "url": link.strip()})
+    return out
+
+
+def in_window(items: list[dict], since: datetime, until: datetime) -> list[dict]:
+    """구간 안 기사만, 최신순. 같은 링크·같은 제목은 먼저 나온 것 하나만."""
+    seen, out = set(), []
+    for it in sorted((i for i in items if i["time"] and since < i["time"] <= until), key=lambda i: i["time"]):
+        keys = {it["title"].lower()} | ({it["url"]} if it["url"] else set())
+        if keys & seen:
+            continue
+        seen |= keys
+        out.append(it)
+    return out[::-1]
+
+
 def fmt_kst(t: datetime) -> str:
     t = t.astimezone(KST)
     return f"{t.month}/{t.day} {t:%H:%M}"
@@ -56,43 +109,34 @@ def window_label(since: datetime, until: datetime) -> str:
     return f"{fmt_kst(since)} ~ {fmt_kst(until)} (한국시간)"
 
 
-def instructions(kind: str, since: datetime, until: datetime, tickers: list[str], out_dir: str) -> str:
-    """루틴이 읽고 따를 뉴스 고르기·원문 찾기·요약 지침."""
+def instructions(kind: str, since: datetime, until: datetime, tickers: list[str], out_dir: str, count: int) -> str:
+    """루틴이 읽고 따를 뉴스 고르기·요약 지침."""
     n = MAX_ITEMS[kind]
     return f"""# 주요 뉴스 요약 지침 ({LABEL[kind]})
 
-입력: {out_dir}/page.txt (saveticker.com/news 화면 글자), {out_dir}/links.json (화면의 링크 글자·주소),
-      {out_dir}/api.json (페이지가 받은 JSON, 있으면)
-가져온 시각: {fmt_kst(until)} 한국시간 = {until.astimezone(ET):%m/%d %H:%M} 뉴욕시간
+입력: {out_dir}/items.txt (언론사 RSS 기사 {count}건: [한국시간] (매체) 제목 / 요약 / 링크, 최신순)
 구간: {since.astimezone(KST):%Y-%m-%d %H:%M} ~ {until.astimezone(KST):%Y-%m-%d %H:%M} 한국시간
       ({since.astimezone(ET):%m/%d %H:%M} ~ {until.astimezone(ET):%m/%d %H:%M} 뉴욕시간)
+items.txt 에는 이미 구간 안 기사만 들어 있다.
 
-1. 구간 안에 올라온 뉴스만 쓴다. "3시간 전" 같은 상대 시각은 가져온 시각 기준으로 계산한다.
-   시각을 알 수 없는 뉴스는 뺀다. api.json 에 발행 시각 필드가 있으면 그것을 우선한다.
-2. 제목(과 화면에 보이는 짧은 본문)만 보고 미국 증시에 영향이 큰 것만 고른다 (중요한 순서, 최대 {n}개):
+1. 미국 증시에 영향이 큰 것만 고른다 (중요한 순서, 최대 {n}개. 적으면 적은 대로):
    - 연준·금리(FOMC, 연준 인사 발언, 국채금리 급변), 경제지표(CPI·고용·PCE·ISM·소매판매 등) 결과
    - 관세·무역·정부 정책·지정학(전쟁·제재·선거), 셧다운·부채한도
    - 대형주 실적·가이던스·대형 인수합병·규제, 반도체·AI 업황
    - 유가·달러·금·비트코인의 큰 움직임, 아시아·유럽 증시 급변
    - 관심 종목: {", ".join(tickers)}
-   빼는 것: 단순 시세 요약, 소형주 목표가 조정, 광고·칼럼·의견, 같은 사건의 중복(하나로 합침).
-3. 고른 뉴스마다 원문 보도를 찾는다 (이 환경은 언론사 사이트에 직접 접속할 수 없으므로 WebSearch 를 쓴다):
-   - links.json 에 그 뉴스의 외부 원문 주소가 있으면 그 주소와 제목으로 검색한다.
-   - 없으면 제목의 핵심어(회사·인물·숫자)를 영어로 바꿔 검색한다. mode 는 "standard", 맞는 결과가 없을 때만
-     "extended" 로 한 번 더. 전체 검색은 {n + 4}번 안쪽으로 한다.
-   - **같은 사건으로 인정하는 조건**: 주체(회사·기관·인물)와 내용이 제목과 같고, 보도 날짜가 구간 안(또는 하루 안쪽)이다.
-     하나라도 어긋나면(예전 기사, 비슷한 다른 사건) 쓰지 않는다.
-   - 인정되면 basis "원문", url 은 그 보도 주소. 인정되는 것이 없으면 basis "제목", url 은 links.json 의 saveticker 주소(없으면 빈 문자열)이고
-     요약은 제목·화면 글자에 있는 내용만으로 쓴다.
-4. 각 뉴스: 제목은 한국어 한 줄(40자 안쪽), 요약은 한국어 1~2문장으로 숫자(%, 금액, 예상치 대비)를 살려 쓴다.
-   과장·추측을 더하지 말고 원문(또는 제목)에 있는 내용만 쓴다. 검색 결과끼리 숫자가 다르면 숫자를 빼고 쓴다.
-5. {out_dir}/news.json 에 아래 형식으로 저장한다 (UTF-8, JSON 만):
+   빼는 것: 단순 시세 요약, 소형주·목표가 조정, 광고·칼럼·의견·생활 기사.
+   같은 사건을 여러 매체가 쓴 경우 하나로 합치고, 가장 먼저 나온 기사의 시각·링크를 쓴다.
+2. 각 뉴스: 제목은 한국어 한 줄(40자 안쪽), 요약은 한국어 1~2문장으로 숫자(%, 금액, 예상치 대비)를 살려 쓴다.
+   items.txt 의 제목·요약에 있는 내용만 쓴다. 요약이 너무 짧아 핵심(숫자·결과)을 알 수 없을 때만
+   WebSearch 로 같은 사건 보도를 찾아 보탠다 — 주체와 내용이 같고 보도 날짜가 구간 안(하루 안쪽)일 때만 쓴다.
+   언론사 사이트에 curl·WebFetch 로 직접 접속하지 않는다.
+3. {out_dir}/news.json 에 아래 형식으로 저장한다 (UTF-8, JSON 만):
 {{"status": "ok", "items": [
-  {{"time": "10/13 05:12", "title": "...", "summary": "...", "tickers": ["NVDA"], "basis": "원문", "source": "Reuters", "url": "https://..."}}
+  {{"time": "10/13 05:12", "title": "...", "summary": "...", "tickers": ["NVDA"], "source": "CNBC", "url": "https://..."}}
 ]}}
-   - time 은 한국시간 "월/일 시:분" (saveticker 에 올라온 시각). source 는 원문 매체 이름(basis "제목"이면 빈 문자열).
+   - time 은 items.txt 의 한국시간 그대로, source 는 매체 이름, url 은 기사 링크.
    - 고를 뉴스가 없으면 {{"status": "none", "items": []}}.
-   - page.txt 가 비었거나 로그인·차단 화면이라 뉴스 목록을 읽을 수 없으면 {{"status": "fail", "note": "이유 한 줄", "items": []}}.
 """
 
 
@@ -117,11 +161,9 @@ def _head(fetch_meta: dict) -> str:
     return f"📰 주요 뉴스 · {window_label(since, until)}"
 
 
-def _basis(it: dict) -> str:
-    """요약 근거: 원문 매체 이름, 원문을 못 찾았으면 '제목만'."""
-    if it.get("basis") == "제목":
-        return "원문 못 찾음 · 제목 기준"
-    return str(it.get("source") or "원문")
+def _sources(fetch_meta: dict) -> str:
+    names = list(dict.fromkeys(n.split()[0] for n, r in (fetch_meta.get("feeds") or {}).items() if r.startswith("ok")))
+    return "출처: " + (", ".join(names) + " RSS" if names else "언론사 RSS")
 
 
 def render_html(summary: dict, fetch_meta: dict) -> str:
@@ -143,10 +185,11 @@ def render_html(summary: dict, fetch_meta: dict) -> str:
             parts.append(f"<li style='margin-bottom:6px'><span class='m'>{e(str(it.get('time', '')))}</span> "
                          f"<b>{title}</b>" + (f" <span class='m'>{e(tick)}</span>" if tick else "")
                          + f"<br><span style='font-size:13px'>{e(str(it.get('summary', '')))}</span>"
-                         + f" <span class='m' style='font-size:12px'>({e(_basis(it))})</span></li>")
+                         + (f" <span class='m' style='font-size:12px'>({e(str(it['source']))})</span>"
+                            if it.get("source") else "") + "</li>")
         parts.append("</ul>")
-    parts.append(f"<div class='m' style='font-size:12px;margin-top:4px'>출처: <a href='{URL}'>saveticker.com/news</a>"
-                 " · 원문은 웹 검색으로 찾음 · 고르기·요약은 자동 (원문 확인 권장)</div></div>")
+    parts.append(f"<div class='m' style='font-size:12px;margin-top:4px'>{e(_sources(fetch_meta))}"
+                 " · 고르기·요약은 자동 (원문 확인 권장)</div></div>")
     return "".join(parts)
 
 
@@ -160,8 +203,8 @@ def render_text(summary: dict, fetch_meta: dict) -> str:
     for it in items:
         tick = " ".join(it.get("tickers") or [])
         lines.append(f"- {it.get('time', '')} {it.get('title', '')}" + (f" ({tick})" if tick else ""))
-        lines.append(f"  {it.get('summary', '')} ({_basis(it)})")
-    lines.append(f"출처: {URL}")
+        lines.append(f"  {it.get('summary', '')}" + (f" ({it['source']})" if it.get("source") else ""))
+    lines.append(_sources(fetch_meta))
     return "\n".join(lines)
 
 

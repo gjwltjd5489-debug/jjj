@@ -51,7 +51,8 @@
 
 ## 4. 주요 뉴스 (두 메일 맨 아래, `scripts/fetch_news.py` · `scripts/append_news.py`)
 
-[saveticker.com/news](https://www.saveticker.com/news)에서 뉴스를 받아 중요한 것만 골라 요약해 메일 맨 아래에 붙인다.
+언론사 RSS(`config/news_feeds.csv`: CNBC·MarketWatch·Yahoo Finance·한국경제)에서 구간 안 기사를 모아 중요한 것만 골라 요약해 메일 맨 아래에 붙인다.
+처음에는 saveticker.com/news 를 쓰려 했으나, 사이트 전체가 Cloudflare 봇 확인 뒤에 있어 루틴 환경에서 통과하지 못해 RSS 로 바꿨다.
 
 | 메일 | 뉴스 구간 |
 |---|---|
@@ -61,8 +62,8 @@
 구간 시작은 상대 메일의 **예정 시각**이다(`scoring/news.py` `SCHEDULE`, 루틴 cron 과 같게 유지). 루틴이 늦게 돌면 앞 메일과 몇십 분 겹칠 수 있다.
 
 **흐름**
-1. `python scripts/fetch_news.py --kind morning|intraday --out-dir out/news`: 헤드리스 크롬(Playwright, `/opt/pw-browsers`)으로 페이지를 열고 내려 가며 더 불러온 뒤 화면 글자(`page.txt`), 링크(`links.json`), 페이지가 받은 JSON(`api.json`), 고르기·요약 지침(`instructions.txt`), `meta.json`을 쓴다. 로그인 없이 보이는 목록만 쓴다. Playwright 가 없으면 HTML 만 받는다. 실패해도 종료 코드 0, `meta.json`의 `status`가 `fail`.
-2. 루틴(Claude)이 `instructions.txt`를 따라 `news.json`을 쓴다: 구간 안 뉴스 중 연준·금리·경제지표·관세·지정학·대형주 실적·관심 종목 위주로 아침 최대 8개, 장초반 최대 6개를 제목만 보고 고른다. 고른 뉴스마다 **웹 검색으로 원문 보도를 찾아**(루틴 환경은 언론사 사이트에 직접 접속할 수 없음) 그 내용으로 제목 한 줄 + 숫자를 살린 1~2문장 요약을 쓴다. 주체·내용이 같고 보도 날짜가 구간 안(하루 안쪽)인 기사만 원문으로 인정하고, 못 찾으면 제목·화면 글자만으로 쓰고 메일에 `원문 못 찾음 · 제목 기준`으로 표시한다. 원문을 찾은 뉴스에는 매체 이름과 원문 링크가 붙는다.
-3. `python scripts/append_news.py --news-dir out/news --html … --body …`: `news.json`을 HTML·텍스트 맨 아래에 붙인다. 가져오기에 실패했거나 `news.json`이 없으면 이유 한 줄을 붙이고 메일은 그대로 나간다. 두 번 돌려도 뉴스 구역은 하나.
+1. `python scripts/fetch_news.py --kind morning|intraday --out-dir out/news`: 피드를 받아 발행 시각이 구간 안인 기사만 최신순으로 `items.txt`·`items.json`에 쓴다(같은 링크·제목은 먼저 나온 것 하나). 고르기·요약 지침(`instructions.txt`)과 피드별 결과(`meta.json`)도 쓴다. 피드 하나가 실패해도 나머지로 진행하고, 모두 실패해도 종료 코드 0(`status` `fail`).
+2. 루틴(Claude)이 `instructions.txt`를 따라 `news.json`을 쓴다: 연준·금리·경제지표·관세·지정학·대형주 실적·관심 종목 위주로 아침 최대 8개, 장초반 최대 6개. 여러 매체의 같은 사건은 하나로 합친다. 제목 한 줄 + RSS 제목·요약에 있는 내용만으로 숫자를 살린 1~2문장 요약. 요약이 너무 짧을 때만 웹 검색으로 같은 사건 보도(주체·내용이 같고 날짜가 구간 안)를 찾아 보탠다.
+3. `python scripts/append_news.py --news-dir out/news --html … --body …`: `news.json`을 HTML·텍스트 맨 아래에 붙인다(제목에 기사 링크, 끝에 매체 이름, 맨 아래에 받은 피드). 가져오기에 실패했거나 `news.json`이 없으면 이유 한 줄을 붙이고 메일은 그대로 나간다. 두 번 돌려도 뉴스 구역은 하나.
 
-**접속 허용:** 루틴이 도는 클라우드 환경의 네트워크 설정에서 `www.saveticker.com`과 `challenges.cloudflare.com`(사이트 앞단의 Cloudflare 봇 확인)을 허용해야 한다. 막혀 있으면 메일에 "사이트 접속 차단", 봇 확인이 풀리지 않으면 "Cloudflare 봇 확인을 통과하지 못함" 안내가 붙는다. 봇 확인 화면은 최대 30초 기다린다.
+**접속 허용:** 루틴이 도는 클라우드 환경의 네트워크 설정에서 `www.cnbc.com`, `feeds.content.dowjones.io`, `finance.yahoo.com`, `www.hankyung.com`을 허용해야 한다. 모두 막혀 있으면 메일에 허용할 도메인 목록이 붙는다. 피드를 바꾸려면 `config/news_feeds.csv`만 고치면 된다.

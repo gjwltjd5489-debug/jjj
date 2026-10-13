@@ -65,7 +65,7 @@ python scripts/rotate_basket.py --demo     # 인터넷 없이 대용 데이터�
 - `scoring/basket.py` — 후보 유니버스, 수익률·점수 상관, 저상관 종목 선정
 - `scoring/portfolio.py` — 상위 n 로테이션 백테스트, 동일가중 비교
 - `scoring/bigtech.py` — 빅테크 칸: 해마다 나스닥 거래대금 상위 10 (`config/bigtech.csv`, `scripts/update_bigtech.py`)
-- `scoring/news.py` — 메일 아래 주요 뉴스: 구간 계산, 요약 지침, HTML·텍스트 붙이기 (`scripts/fetch_news.py`, `scripts/append_news.py`)
+- `scoring/news.py` — 메일 아래 주요 뉴스: 구간 계산, RSS 파싱, 요약 지침, HTML·텍스트 붙이기 (`config/news_feeds.csv`, `scripts/fetch_news.py`, `scripts/append_news.py`)
 - `scoring/sources.py`, `scoring/data.py` — CSV / FinanceDataReader / 샘플 데이터 로더
 
 ## 새 카드 만들기

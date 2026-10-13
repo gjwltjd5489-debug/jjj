@@ -1,9 +1,8 @@
 name,url
-CNBC,https://www.cnbc.com/id/100003114/device/rss/rss.html
-CNBC 경제,https://www.cnbc.com/id/20910258/device/rss/rss.html
-CNBC 실적,https://www.cnbc.com/id/10001147/device/rss/rss.html
+WSJ 시장,https://feeds.content.dowjones.io/public/rss/RSSMarketsMain
+WSJ 기업,https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness
+WSJ 국제,https://feeds.content.dowjones.io/public/rss/RSSWorldNews
 MarketWatch,https://feeds.content.dowjones.io/public/rss/mw_topstories
-MarketWatch 시장,https://feeds.content.dowjones.io/public/rss/mw_marketpulse
-Yahoo Finance,https://finance.yahoo.com/news/rssindex
+MarketWatch 속보,https://feeds.content.dowjones.io/public/rss/mw_bulletins
 한국경제 증권,https://www.hankyung.com/feed/finance
 한국경제 국제,https://www.hankyung.com/feed/international

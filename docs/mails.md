@@ -51,7 +51,7 @@
 
 ## 4. 주요 뉴스 (두 메일 맨 아래, `scripts/fetch_news.py` · `scripts/append_news.py`)
 
-언론사 RSS(`config/news_feeds.csv`: CNBC·MarketWatch·Yahoo Finance·한국경제)에서 구간 안 기사를 모아 중요한 것만 골라 요약해 메일 맨 아래에 붙인다.
+언론사 RSS(`config/news_feeds.csv`: WSJ 시장·기업·국제, MarketWatch 주요·속보, 한국경제 증권·국제)에서 구간 안 기사를 모아 중요한 것만 골라 요약해 메일 맨 아래에 붙인다.
 처음에는 saveticker.com/news 를 쓰려 했으나, 사이트 전체가 Cloudflare 봇 확인 뒤에 있어 루틴 환경에서 통과하지 못해 RSS 로 바꿨다.
 
 | 메일 | 뉴스 구간 |
@@ -66,4 +66,4 @@
 2. 루틴(Claude)이 `instructions.txt`를 따라 `news.json`을 쓴다: 연준·금리·경제지표·관세·지정학·대형주 실적·관심 종목 위주로 아침 최대 8개, 장초반 최대 6개. 여러 매체의 같은 사건은 하나로 합친다. 제목 한 줄 + RSS 제목·요약에 있는 내용만으로 숫자를 살린 1~2문장 요약. 요약이 너무 짧을 때만 웹 검색으로 같은 사건 보도(주체·내용이 같고 날짜가 구간 안)를 찾아 보탠다.
 3. `python scripts/append_news.py --news-dir out/news --html … --body …`: `news.json`을 HTML·텍스트 맨 아래에 붙인다(제목에 기사 링크, 끝에 매체 이름, 맨 아래에 받은 피드). 가져오기에 실패했거나 `news.json`이 없으면 이유 한 줄을 붙이고 메일은 그대로 나간다. 두 번 돌려도 뉴스 구역은 하나.
 
-**접속 허용:** 루틴이 도는 클라우드 환경의 네트워크 설정에서 `www.cnbc.com`, `feeds.content.dowjones.io`, `finance.yahoo.com`, `www.hankyung.com`을 허용해야 한다. 모두 막혀 있으면 메일에 허용할 도메인 목록이 붙는다. 피드를 바꾸려면 `config/news_feeds.csv`만 고치면 된다.
+**접속 허용:** 루틴이 도는 클라우드 환경의 네트워크 설정에서 `feeds.content.dowjones.io`(WSJ·MarketWatch)와 `www.hankyung.com`을 허용해야 한다. CNBC 는 클라우드 서버 접속을 403 으로 막고, Yahoo Finance 는 종목별 피드만 있어 뺐다. MarketWatch 시장(mw_marketpulse)은 7월 이후 갱신이 없어 뺐다. 한국경제 피드는 최근 50건만 담아 아침 메일의 긴 구간은 일부만 덮는다. 모두 막혀 있으면 메일에 허용할 도메인 목록이 붙는다. 피드를 바꾸려면 `config/news_feeds.csv`만 고치면 된다.

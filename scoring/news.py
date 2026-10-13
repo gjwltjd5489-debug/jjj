@@ -57,32 +57,42 @@ def window_label(since: datetime, until: datetime) -> str:
 
 
 def instructions(kind: str, since: datetime, until: datetime, tickers: list[str], out_dir: str) -> str:
-    """루틴이 읽고 따를 뉴스 고르기·요약 지침."""
+    """루틴이 읽고 따를 뉴스 고르기·원문 찾기·요약 지침."""
     n = MAX_ITEMS[kind]
     return f"""# 주요 뉴스 요약 지침 ({LABEL[kind]})
 
-입력: {out_dir}/page.txt (saveticker.com/news 화면 글자), {out_dir}/api.json (페이지가 받은 JSON, 있으면)
+입력: {out_dir}/page.txt (saveticker.com/news 화면 글자), {out_dir}/links.json (화면의 링크 글자·주소),
+      {out_dir}/api.json (페이지가 받은 JSON, 있으면)
 가져온 시각: {fmt_kst(until)} 한국시간 = {until.astimezone(ET):%m/%d %H:%M} 뉴욕시간
 구간: {since.astimezone(KST):%Y-%m-%d %H:%M} ~ {until.astimezone(KST):%Y-%m-%d %H:%M} 한국시간
       ({since.astimezone(ET):%m/%d %H:%M} ~ {until.astimezone(ET):%m/%d %H:%M} 뉴욕시간)
 
 1. 구간 안에 올라온 뉴스만 쓴다. "3시간 전" 같은 상대 시각은 가져온 시각 기준으로 계산한다.
    시각을 알 수 없는 뉴스는 뺀다. api.json 에 발행 시각 필드가 있으면 그것을 우선한다.
-2. 미국 증시에 영향이 큰 것만 고른다 (중요한 순서, 최대 {n}개):
+2. 제목(과 화면에 보이는 짧은 본문)만 보고 미국 증시에 영향이 큰 것만 고른다 (중요한 순서, 최대 {n}개):
    - 연준·금리(FOMC, 연준 인사 발언, 국채금리 급변), 경제지표(CPI·고용·PCE·ISM·소매판매 등) 결과
    - 관세·무역·정부 정책·지정학(전쟁·제재·선거), 셧다운·부채한도
    - 대형주 실적·가이던스·대형 인수합병·규제, 반도체·AI 업황
    - 유가·달러·금·비트코인의 큰 움직임, 아시아·유럽 증시 급변
    - 관심 종목: {", ".join(tickers)}
-3. 빼는 것: 단순 시세 요약, 소형주 목표가 조정, 광고·칼럼·의견, 같은 사건의 중복(하나로 합침).
+   빼는 것: 단순 시세 요약, 소형주 목표가 조정, 광고·칼럼·의견, 같은 사건의 중복(하나로 합침).
+3. 고른 뉴스마다 원문 보도를 찾는다 (이 환경은 언론사 사이트에 직접 접속할 수 없으므로 WebSearch 를 쓴다):
+   - links.json 에 그 뉴스의 외부 원문 주소가 있으면 그 주소와 제목으로 검색한다.
+   - 없으면 제목의 핵심어(회사·인물·숫자)를 영어로 바꿔 검색한다. mode 는 "standard", 맞는 결과가 없을 때만
+     "extended" 로 한 번 더. 전체 검색은 {n + 4}번 안쪽으로 한다.
+   - **같은 사건으로 인정하는 조건**: 주체(회사·기관·인물)와 내용이 제목과 같고, 보도 날짜가 구간 안(또는 하루 안쪽)이다.
+     하나라도 어긋나면(예전 기사, 비슷한 다른 사건) 쓰지 않는다.
+   - 인정되면 basis "원문", url 은 그 보도 주소. 인정되는 것이 없으면 basis "제목", url 은 links.json 의 saveticker 주소(없으면 빈 문자열)이고
+     요약은 제목·화면 글자에 있는 내용만으로 쓴다.
 4. 각 뉴스: 제목은 한국어 한 줄(40자 안쪽), 요약은 한국어 1~2문장으로 숫자(%, 금액, 예상치 대비)를 살려 쓴다.
-   과장·추측을 더하지 말고 원문에 있는 내용만 쓴다.
+   과장·추측을 더하지 말고 원문(또는 제목)에 있는 내용만 쓴다. 검색 결과끼리 숫자가 다르면 숫자를 빼고 쓴다.
 5. {out_dir}/news.json 에 아래 형식으로 저장한다 (UTF-8, JSON 만):
 {{"status": "ok", "items": [
-  {{"time": "10/13 05:12", "title": "...", "summary": "...", "tickers": ["NVDA"], "url": "원문 링크(있으면, 없으면 빈 문자열)"}}
+  {{"time": "10/13 05:12", "title": "...", "summary": "...", "tickers": ["NVDA"], "basis": "원문", "source": "Reuters", "url": "https://..."}}
 ]}}
-   - time 은 한국시간 "월/일 시:분". 고를 뉴스가 없으면 {{"status": "none", "items": []}}.
-   - page.txt 가 비었거나 로그인·차단 화면이라 뉴스를 읽을 수 없으면 {{"status": "fail", "note": "이유 한 줄", "items": []}}.
+   - time 은 한국시간 "월/일 시:분" (saveticker 에 올라온 시각). source 는 원문 매체 이름(basis "제목"이면 빈 문자열).
+   - 고를 뉴스가 없으면 {{"status": "none", "items": []}}.
+   - page.txt 가 비었거나 로그인·차단 화면이라 뉴스 목록을 읽을 수 없으면 {{"status": "fail", "note": "이유 한 줄", "items": []}}.
 """
 
 
@@ -107,6 +117,13 @@ def _head(fetch_meta: dict) -> str:
     return f"📰 주요 뉴스 · {window_label(since, until)}"
 
 
+def _basis(it: dict) -> str:
+    """요약 근거: 원문 매체 이름, 원문을 못 찾았으면 '제목만'."""
+    if it.get("basis") == "제목":
+        return "원문 못 찾음 · 제목 기준"
+    return str(it.get("source") or "원문")
+
+
 def render_html(summary: dict, fetch_meta: dict) -> str:
     e = html.escape
     parts = [MARK, '<div class="ck">', f"<h3>{e(_head(fetch_meta))}</h3>"]
@@ -125,10 +142,11 @@ def render_html(summary: dict, fetch_meta: dict) -> str:
             tick = " ".join(it.get("tickers") or [])
             parts.append(f"<li style='margin-bottom:6px'><span class='m'>{e(str(it.get('time', '')))}</span> "
                          f"<b>{title}</b>" + (f" <span class='m'>{e(tick)}</span>" if tick else "")
-                         + f"<br><span style='font-size:13px'>{e(str(it.get('summary', '')))}</span></li>")
+                         + f"<br><span style='font-size:13px'>{e(str(it.get('summary', '')))}</span>"
+                         + f" <span class='m' style='font-size:12px'>({e(_basis(it))})</span></li>")
         parts.append("</ul>")
     parts.append(f"<div class='m' style='font-size:12px;margin-top:4px'>출처: <a href='{URL}'>saveticker.com/news</a>"
-                 " · 고르기·요약은 자동 (원문 확인 권장)</div></div>")
+                 " · 원문은 웹 검색으로 찾음 · 고르기·요약은 자동 (원문 확인 권장)</div></div>")
     return "".join(parts)
 
 
@@ -142,7 +160,7 @@ def render_text(summary: dict, fetch_meta: dict) -> str:
     for it in items:
         tick = " ".join(it.get("tickers") or [])
         lines.append(f"- {it.get('time', '')} {it.get('title', '')}" + (f" ({tick})" if tick else ""))
-        lines.append(f"  {it.get('summary', '')}")
+        lines.append(f"  {it.get('summary', '')} ({_basis(it)})")
     lines.append(f"출처: {URL}")
     return "\n".join(lines)
 

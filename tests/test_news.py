@@ -52,3 +52,11 @@ def test_append_is_idempotent():
     assert body == "본문\n\n" + t + "\n" and "<!--" not in body
     wrapped = append("<html><body>x</body></html>", MARK + "N")
     assert append(wrapped, MARK + "M") == "<html><body>x" + MARK + "M</body></html>"
+
+
+def test_basis_label_shows_source_or_headline_only():
+    s = {"items": [{"title": "a", "summary": "x", "basis": "원문", "source": "Reuters"},
+                   {"title": "b", "summary": "y", "basis": "제목"}]}
+    h = render_html(s, META)
+    assert "(Reuters)" in h and "(원문 못 찾음 · 제목 기준)" in h
+    assert "  y (원문 못 찾음 · 제목 기준)" in render_text(s, META)

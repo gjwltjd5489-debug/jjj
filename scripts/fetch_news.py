@@ -1,12 +1,12 @@
 """saveticker.com/news 화면을 받아 루틴이 요약할 재료를 만든다.
 
 헤드리스 크롬(Playwright)으로 페이지를 열고 아래로 내려 뉴스를 더 불러온 뒤
-화면 글자(page.txt)와 페이지가 받은 JSON(api.json)을 저장한다. Playwright 가 없으면 HTML 만 받는다.
+화면 글자(page.txt), 링크(links.json), 페이지가 받은 JSON(api.json)을 저장한다. Playwright 가 없으면 HTML 만 받는다.
 실패해도 종료 코드는 0이고, meta.json 의 status 가 "fail" 이 된다 (메일은 뉴스 없이 나가야 하므로).
 
 예)
   python -m pip install playwright==1.56.0          # 크롬은 /opt/pw-browsers 에 이미 있음
-  python scripts/fetch_news.py --kind morning --out-dir out/news     # page.txt, api.json, instructions.txt, meta.json
+  python scripts/fetch_news.py --kind morning --out-dir out/news     # page.txt, links.json, api.json, instructions.txt, meta.json
   python scripts/fetch_news.py --kind intraday --now "2026-10-13T10:03-04:00" --out-dir out/news
 """
 
@@ -16,6 +16,7 @@ import argparse
 import json
 import re
 import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from html.parser import HTMLParser
@@ -27,11 +28,12 @@ sys.path.insert(0, str(ROOT))
 from scoring.news import KST, URL, instructions, window  # noqa: E402
 
 API_MAX = 2_000_000   # api.json 최대 글자 수
+LINK_MIN = 8          # 이보다 짧은 링크 글자(메뉴·버튼)는 버린다
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/141.0 Safari/537.36")
 
 
-def fetch_browser(url: str, scrolls: int) -> tuple[str, list]:
+def fetch_browser(url: str, scrolls: int) -> tuple[str, list, list]:
     from playwright.sync_api import sync_playwright
 
     found: list = []
@@ -68,28 +70,38 @@ def fetch_browser(url: str, scrolls: int) -> tuple[str, list]:
                 break
             height = h
         text = page.inner_text("body")
+        links = page.eval_on_selector_all("a[href]", "els => els.map(a => [a.innerText.trim(), a.href])")
         browser.close()
-    return text, found
+    return text, found, links
 
 
 class _Text(HTMLParser):
     def __init__(self):
         super().__init__()
         self.out: list[str] = []
+        self.links: list[list[str]] = []
+        self.href: str | None = None
         self.skip = 0
 
     def handle_starttag(self, tag, attrs):
         self.skip += tag in ("script", "style")
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+            self.links.append(["", self.href or ""])
 
     def handle_endtag(self, tag):
         self.skip -= tag in ("script", "style") and self.skip > 0
+        if tag == "a":
+            self.href = None
 
     def handle_data(self, data):
         if not self.skip and data.strip():
             self.out.append(data.strip())
+            if self.href is not None:
+                self.links[-1][0] = (self.links[-1][0] + " " + data.strip()).strip()
 
 
-def fetch_plain(url: str) -> tuple[str, list]:
+def fetch_plain(url: str) -> tuple[str, list, list]:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "ko-KR"})
     raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
     found = []
@@ -98,7 +110,7 @@ def fetch_plain(url: str) -> tuple[str, list]:
         found.append({"url": url + " (__NEXT_DATA__)", "data": json.loads(m.group(1))})
     p = _Text()
     p.feed(raw)
-    return "\n".join(p.out), found
+    return "\n".join(p.out), found, [[t, urllib.parse.urljoin(url, h)] for t, h in p.links]
 
 
 def main() -> None:
@@ -116,10 +128,10 @@ def main() -> None:
     d.mkdir(parents=True, exist_ok=True)
     meta = {"kind": args.kind, "url": args.url, "since": since.isoformat(), "until": until.isoformat()}
 
-    text, found, errors = "", [], []
+    text, found, links, errors = "", [], [], []
     for name, fn in (("browser", lambda: fetch_browser(args.url, args.scrolls)), ("plain", lambda: fetch_plain(args.url))):
         try:
-            text, found = fn()
+            text, found, links = fn()
             meta["method"] = name
             if len(text.strip()) >= 200:
                 break
@@ -137,6 +149,9 @@ def main() -> None:
 
     api = json.dumps(found, ensure_ascii=False)
     (d / "page.txt").write_text(text, encoding="utf-8")
+    keep = {h: " ".join(t.split()) for t, h in links if len(t.strip()) >= LINK_MIN and h.startswith("http")}
+    (d / "links.json").write_text("[\n" + ",\n".join(json.dumps({"text": t, "url": h}, ensure_ascii=False)
+                                                   for h, t in keep.items()) + "\n]\n", encoding="utf-8")
     (d / "api.json").write_text(api[:API_MAX] if len(api) <= API_MAX else json.dumps(
         [{"url": f["url"]} for f in found], ensure_ascii=False), encoding="utf-8")
     (d / "news.json").unlink(missing_ok=True)

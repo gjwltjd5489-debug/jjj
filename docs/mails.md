@@ -48,3 +48,21 @@
 - FOMC 금리 결정일과 CPI 발표일을 적는다. 2026년 남은 CPI 발표일(10/14, 11/10, 12/10)과 2027년 FOMC 결정일까지 들어 있다.
 - 마지막 CPI 날짜까지 35일이 안 남으면 메일 "한눈에 보기"에 갱신 안내가 붙는다. 노동통계국이 다음 해 CPI 일정을 발표하면 추가한다.
 - 실적 발표일은 yfinance에서 매번 받는다(예정일이라 바뀔 수 있음). 받지 못하면 일정에서 빠질 뿐 메일은 나간다.
+
+## 4. 주요 뉴스 (두 메일 맨 아래, `scripts/fetch_news.py` · `scripts/append_news.py`)
+
+[saveticker.com/news](https://www.saveticker.com/news)에서 뉴스를 받아 중요한 것만 골라 요약해 메일 맨 아래에 붙인다.
+
+| 메일 | 뉴스 구간 |
+|---|---|
+| 아침 메일 (서울 화~토 06:00) | 직전 장초반 메일(뉴욕 10:03) 뒤 ~ 지금. 장중 후반·마감·시간외·새벽 |
+| 장초반 메일 (뉴욕 월~금 10:03) | 직전 아침 메일(서울 06:00) 뒤 ~ 지금. 월요일은 주말 전부 |
+
+구간 시작은 상대 메일의 **예정 시각**이다(`scoring/news.py` `SCHEDULE`, 루틴 cron 과 같게 유지). 루틴이 늦게 돌면 앞 메일과 몇십 분 겹칠 수 있다.
+
+**흐름**
+1. `python scripts/fetch_news.py --kind morning|intraday --out-dir out/news`: 헤드리스 크롬(Playwright, `/opt/pw-browsers`)으로 페이지를 열고 내려 가며 더 불러온 뒤 화면 글자(`page.txt`)와 페이지가 받은 JSON(`api.json`), 고르기·요약 지침(`instructions.txt`), `meta.json`을 쓴다. Playwright 가 없으면 HTML 만 받는다. 실패해도 종료 코드 0, `meta.json`의 `status`가 `fail`.
+2. 루틴(Claude)이 `instructions.txt`를 따라 `news.json`을 쓴다: 구간 안 뉴스 중 연준·금리·경제지표·관세·지정학·대형주 실적·관심 종목 위주로 아침 최대 8개, 장초반 최대 6개. 제목 한 줄 + 숫자를 살린 1~2문장 요약.
+3. `python scripts/append_news.py --news-dir out/news --html … --body …`: `news.json`을 HTML·텍스트 맨 아래에 붙인다. 가져오기에 실패했거나 `news.json`이 없으면 이유 한 줄을 붙이고 메일은 그대로 나간다. 두 번 돌려도 뉴스 구역은 하나.
+
+**접속 허용:** 루틴이 도는 클라우드 환경의 네트워크 설정에서 `www.saveticker.com`을 허용해야 한다. 막혀 있으면 메일에 "사이트 접속 차단" 안내가 붙는다.
